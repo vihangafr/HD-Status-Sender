@@ -18,10 +18,10 @@
  *      - Photos sent as files are converted into crisp HD Status MP4 videos
  *        (default 7s; add e.g. "12s" in the file caption to change length).
  * 4. The bot sends the ready-to-post HD clip(s) back to your chat and
- *    immediately deletes all temporary files from disk.
- * 5. Reply/quote any video, photo, or media document with `.status`
- *    (or `.status your caption`) to publish it directly to the bot's own
- *    WhatsApp Status in full original quality and native FPS (e.g., 60 fps).
+ * 5. Reply/quote any video, photo, or image/video file (document) with `.status`
+ *    (or `.status your caption`) — or send a photo/video/file with `.status` as
+ *    its caption — to publish it directly to the bot's own WhatsApp Status in
+ *    full original quality and native FPS (e.g., 60 fps).
  *
  * VPS SETUP (Ubuntu / Debian):
  *   sudo apt update && sudo apt install -y ffmpeg
@@ -70,34 +70,35 @@ const CONFIG = {
     .map((n) => `${n}@s.whatsapp.net`),
   maxInputBytes: Number(process.env.MAX_INPUT_MB || 250) * 1024 * 1024,
   // WhatsApp Status re-compresses/rejects clips over ~16 MB; keep a safety margin.
-  maxOutputBytes: 15.4 * 1024 * 1024,
-  targetOutputMb: 14.8,
-  defaultPhotoDurationSec: Math.min(29, Math.max(3, Number(process.env.PHOTO_DURATION_SEC || 7))),
-  // WAstatus-tested HD Status profiles
-  profiles: {
-    '1080p': {
-      name: '1080p HD',
-      maxShortEdge: 1080,
-      maxLongEdge: 1920,
-      partDurationSec: 29,
-      fps: 30,
-      crf: 20,
-      maxVideoBitrateKbps: 5500,
-    },
-    '720p': {
-      name: '720p Extended',
-      maxShortEdge: 720,
-      maxLongEdge: 1280,
-      partDurationSec: 59,
-      fps: 30,
-      crf: 21,
-      maxVideoBitrateKbps: 3000,
-    },
-  },
-};
-
-const VIDEO_EXTS = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v', '.3gp']);
-const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.heif', '.tiff']);
+const VIDEO_EXTS = new Set([
+  '.mp4',
+  '.mov',
+  '.mkv',
+  '.webm',
+  '.avi',
+  '.m4v',
+  '.3gp',
+  '.ts',
+  '.mts',
+  '.m2ts',
+  '.flv',
+  '.wmv',
+  '.mpg',
+  '.mpeg',
+]);
+const IMAGE_EXTS = new Set([
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.webp',
+  '.bmp',
+  '.heic',
+  '.heif',
+  '.tiff',
+  '.tif',
+  '.jfif',
+  '.avif',
+]);
 
 // Track message IDs sent by this bot to prevent reply loops (including self-chat)
 const botSentMessageIds = new Set();
@@ -187,73 +188,28 @@ async function safeSendMessage(sock, jid, content, options = {}) {
 }
 
 /**
- * Normalizes a WhatsApp user JID (strips device suffix like ":12") for status@broadcast.
- */
-function normalizeUserJid(jid) {
-  if (!jid || typeof jid !== 'string') return null;
-  if (
-    jid.endsWith('@g.us') ||
-    jid.endsWith('@newsletter') ||
-    jid.endsWith('@broadcast') ||
-    jid.endsWith('@lid')
-  ) {
-    return null;
-  }
-  const user = jid.split('@')[0].split(':')[0].replace(/\D/g, '');
-  return user ? `${user}@s.whatsapp.net` : null;
-}
-
-function addStatusJid(jid) {
-  const normalized = normalizeUserJid(jid);
-  if (normalized) {
-    knownStatusJids.add(normalized);
-  }
-}
-
-function collectStatusJidsFromItems(items = []) {
-  for (const item of items) {
-    if (!item) continue;
-    addStatusJid(item.phoneNumber);
-    addStatusJid(item.id);
-    addStatusJid(item.jid);
-  }
-}
-
-function getStatusJidList(sock, extraJids = []) {
-  const recipients = new Set(knownStatusJids);
-  addStatusJid(sock?.user?.id);
-  const selfJid = normalizeUserJid(sock?.user?.id);
-  if (selfJid) recipients.add(selfJid);
-
-  for (const jid of extraJids) {
-    const norm = normalizeUserJid(jid);
-    if (norm) recipients.add(norm);
-  }
-
-  return Array.from(recipients);
-}
-
-/**
- * Unwraps ephemeral / view-once / documentWithCaption envelopes from Baileys messages.
+ * Recursively unwraps ephemeral / view-once / documentWithCaption / edited envelopes.
  */
 function unwrapMessage(rawMessage) {
   let msg = rawMessage;
   if (!msg) return null;
 
-  if (msg.ephemeralMessage?.message) {
-    msg = msg.ephemeralMessage.message;
-  }
-  if (msg.viewOnceMessage?.message) {
-    msg = msg.viewOnceMessage.message;
-  }
-  if (msg.viewOnceMessageV2?.message) {
-    msg = msg.viewOnceMessageV2.message;
-  }
-  if (msg.viewOnceMessageV2Extension?.message) {
-    msg = msg.viewOnceMessageV2Extension.message;
-  }
-  if (msg.documentWithCaptionMessage?.message) {
-    msg = msg.documentWithCaptionMessage.message;
+  for (let i = 0; i < 6 && msg; i++) {
+    if (msg.ephemeralMessage?.message) {
+      msg = msg.ephemeralMessage.message;
+    } else if (msg.viewOnceMessage?.message) {
+      msg = msg.viewOnceMessage.message;
+    } else if (msg.viewOnceMessageV2?.message) {
+      msg = msg.viewOnceMessageV2.message;
+    } else if (msg.viewOnceMessageV2Extension?.message) {
+      msg = msg.viewOnceMessageV2Extension.message;
+    } else if (msg.documentWithCaptionMessage?.message) {
+      msg = msg.documentWithCaptionMessage.message;
+    } else if (msg.editedMessage?.message?.protocolMessage?.editedMessage) {
+      msg = msg.editedMessage.message.protocolMessage.editedMessage;
+    } else {
+      break;
+    }
   }
 
   return msg;
@@ -284,13 +240,12 @@ function extractTextAndContext(rawMessage) {
 }
 
 /**
- * Extracts quoted video, photo, or media document metadata from a reply contextInfo.
+ * Extracts video, photo, or image/video document metadata from a message object.
+ * Set allowProbeFallback=true for `.status` so extensionless/octet-stream media files
+ * can still be downloaded and identified via FFprobe.
  */
-function extractQuotedMedia(contextInfo) {
-  const rawQuoted = contextInfo?.quotedMessage;
-  if (!rawQuoted) return null;
-
-  const unwrapped = unwrapMessage(rawQuoted);
+function extractMediaDescriptor(rawMessage, allowProbeFallback = false) {
+  const unwrapped = unwrapMessage(rawMessage);
   if (!unwrapped) return null;
 
   if (unwrapped.videoMessage) {
@@ -320,21 +275,45 @@ function extractQuotedMedia(contextInfo) {
   if (unwrapped.documentMessage) {
     const docMsg = unwrapped.documentMessage;
     const classification = classifyDocument(docMsg);
-    if (!classification) return null;
+    if (classification) {
+      return {
+        kind: classification.kind,
+        ext: classification.ext,
+        mimetype:
+          docMsg.mimetype ||
+          (classification.kind === 'video' ? 'video/mp4' : 'image/jpeg'),
+        caption: docMsg.caption || '',
+        fileLength: Number(docMsg.fileLength || 0),
+        message: { documentMessage: docMsg },
+      };
+    }
 
-    return {
-      kind: classification.kind,
-      ext: classification.ext,
-      mimetype:
-        docMsg.mimetype ||
-        (classification.kind === 'video' ? 'video/mp4' : 'image/jpeg'),
-      caption: docMsg.caption || '',
-      fileLength: Number(docMsg.fileLength || 0),
-      message: { documentMessage: docMsg },
-    };
+    // Fallback for image/video files sent with generic MIME (e.g. application/octet-stream)
+    const mime = (docMsg.mimetype || '').toLowerCase();
+    if (allowProbeFallback && (!mime || mime === 'application/octet-stream')) {
+      const fileName = docMsg.fileName || docMsg.title || '';
+      const ext = path.extname(fileName).toLowerCase() || '.bin';
+      return {
+        kind: 'probe',
+        ext,
+        mimetype: mime || 'application/octet-stream',
+        caption: docMsg.caption || '',
+        fileLength: Number(docMsg.fileLength || 0),
+        message: { documentMessage: docMsg },
+      };
+    }
   }
 
   return null;
+}
+
+/**
+ * Extracts quoted video, photo, or image/video document metadata from a reply contextInfo.
+ */
+function extractQuotedMedia(contextInfo) {
+  const rawQuoted = contextInfo?.quotedMessage;
+  if (!rawQuoted) return null;
+  return extractMediaDescriptor(rawQuoted, true);
 }
 
 /**
@@ -342,7 +321,7 @@ function extractQuotedMedia(contextInfo) {
  */
 function classifyDocument(docMsg) {
   const mime = (docMsg.mimetype || '').toLowerCase();
-  const fileName = docMsg.fileName || '';
+  const fileName = docMsg.fileName || docMsg.title || '';
   const ext = path.extname(fileName).toLowerCase();
 
   if (mime.startsWith('video/') || VIDEO_EXTS.has(ext)) {
@@ -352,6 +331,35 @@ function classifyDocument(docMsg) {
     return { kind: 'image', ext: ext || '.jpg' };
   }
   return null;
+}
+
+/**
+ * Parses optional document caption flags ("720p", "59s", or photo duration like "12s")
+ * and returns any remaining user caption text (empty string if none was provided).
+ */
+function parseCaptionOptions(captionText = '', kind = 'video') {
+  const lower = captionText.toLowerCase();
+  const profileKey = /\b(720p|59s)\b/.test(lower) ? '720p' : '1080p';
+
+  let photoDurationSec = CONFIG.defaultPhotoDurationSec;
+  if (kind === 'image') {
+    const durMatch = lower.match(/\b(\d{1,2})\s*s\b/);
+    if (durMatch) {
+      photoDurationSec = Math.min(29, Math.max(3, Number(durMatch[1])));
+    }
+  }
+
+  let cleaned = captionText.replace(/\b(720p|59s)\b/gi, '');
+  if (kind === 'image') {
+    cleaned = cleaned.replace(/\b\d{1,2}\s*s\b/gi, '');
+  }
+  const userCaption = cleaned.replace(/\s+/g, ' ').trim();
+
+  return {
+    profile: CONFIG.profiles[profileKey],
+    photoDurationSec,
+    userCaption,
+  };
 }
 
 /**
@@ -372,7 +380,7 @@ function parseFrameRate(rateStr) {
 }
 
 /**
- * Probes media metadata (duration, codecs, resolution, FPS, audio availability).
+ * Probes media metadata (duration, codecs, resolution, FPS, still-image detection, audio).
  */
 async function probeMedia(filePath) {
   const { stdout } = await runCommand('ffprobe', [
@@ -395,17 +403,29 @@ async function probeMedia(filePath) {
     parseFrameRate(videoStream?.avg_frame_rate) ||
     parseFrameRate(videoStream?.r_frame_rate) ||
     0;
+  const formatName = (info.format?.format_name || '').toLowerCase();
+  const videoCodec = (videoStream?.codec_name || '').toLowerCase();
+  const nbFrames = Number(videoStream?.nb_frames || 0);
+
+  const isStillImageFormat =
+    /(?:image2|_pipe|webp|heif|heic|avif|bmp|tiff|png|jpeg|mjpeg)/.test(formatName) ||
+    ['mjpeg', 'png', 'webp', 'bmp', 'tiff'].includes(videoCodec);
+  const isStillImage =
+    Boolean(videoStream) &&
+    !audioStream &&
+    (isStillImageFormat || (nbFrames === 1 && duration <= 0.1));
 
   return {
     duration: Number.isFinite(duration) && duration > 0 ? duration : 0,
     hasVideo: Boolean(videoStream),
     hasAudio: Boolean(audioStream),
-    videoCodec: (videoStream?.codec_name || '').toLowerCase(),
+    isStillImage,
+    videoCodec,
     audioCodec: (audioStream?.codec_name || '').toLowerCase(),
     width: Number(videoStream?.width || 0),
     height: Number(videoStream?.height || 0),
     fps: Number.isFinite(fps) ? Number(fps.toFixed(2)) : 0,
-    formatName: (info.format?.format_name || '').toLowerCase(),
+    formatName,
   };
 }
 
@@ -478,34 +498,6 @@ async function verifyFfmpegInstalled() {
       `FFmpeg/FFprobe not found on PATH. Install it on your VPS first (e.g. "sudo apt install -y ffmpeg"). Details: ${err.message}`
     );
   }
-}
-
-/**
- * Probes media metadata (duration & audio stream availability).
- */
-async function probeMedia(filePath) {
-  const { stdout } = await runCommand('ffprobe', [
-    '-v',
-    'error',
-    '-print_format',
-    'json',
-    '-show_format',
-    '-show_streams',
-    filePath,
-  ]);
-
-  const info = JSON.parse(stdout);
-  const streams = Array.isArray(info.streams) ? info.streams : [];
-  const videoStream = streams.find((s) => s.codec_type === 'video');
-  const audioStream = streams.find((s) => s.codec_type === 'audio');
-
-  const duration = Number(info.format?.duration || videoStream?.duration || 0);
-
-  return {
-    duration: Number.isFinite(duration) && duration > 0 ? duration : 0,
-    hasVideo: Boolean(videoStream),
-    hasAudio: Boolean(audioStream),
-  };
 }
 
 /**
@@ -705,46 +697,52 @@ async function encodePhotoToStatusVideo({ inputPath, outputPath, durationSec, pr
 }
 
 /**
- * Prepares quoted media for direct status@broadcast upload at FULL original
- * quality and native FPS (e.g., 60 fps untouched, zero unnecessary re-encoding).
+ * Prepares quoted/direct media (including image/video files) for status@broadcast
+ * at FULL original quality and native FPS (e.g., 60 fps untouched, zero quality drop).
  */
 async function prepareFullQualityStatusMedia({ inputPath, workDir, kind, ext, mimetype }) {
   const normalizedExt = (ext || '').toLowerCase();
+  const meta = await probeMedia(inputPath);
 
-  if (kind === 'image') {
-    const isNativeImage =
+  if (!meta.hasVideo) {
+    throw new Error('The file is not a valid photo or video.');
+  }
+
+  const resolvedKind = kind === 'probe' ? (meta.isStillImage ? 'image' : 'video') : kind;
+  const resLabel = meta.width && meta.height ? `${meta.width}x${meta.height}` : 'native';
+
+  if (resolvedKind === 'image') {
+    const isJpeg =
+      meta.videoCodec === 'mjpeg' ||
       normalizedExt === '.jpg' ||
       normalizedExt === '.jpeg' ||
+      mimetype === 'image/jpeg';
+    const isPng =
+      meta.videoCodec === 'png' ||
       normalizedExt === '.png' ||
-      mimetype === 'image/jpeg' ||
       mimetype === 'image/png';
 
-    if (isNativeImage) {
+    if (isJpeg || isPng) {
       return {
+        kind: 'image',
         finalPath: inputPath,
-        mimetype:
-          normalizedExt === '.png' || mimetype === 'image/png' ? 'image/png' : 'image/jpeg',
-        summary: 'original image (untouched)',
+        mimetype: isPng ? 'image/png' : 'image/jpeg',
+        summary: `${resLabel} original image (untouched)`,
       };
     }
 
-    // Convert non-native formats (HEIC/WebP/BMP/TIFF) at full native resolution & max quality
+    // Convert non-native image files (HEIC/WebP/BMP/TIFF/AVIF) at full native resolution
     const outPath = path.join(workDir, 'status_full_quality.jpg');
     await runCommand('ffmpeg', ['-y', '-i', inputPath, '-q:v', '1', outPath]);
     return {
+      kind: 'image',
       finalPath: outPath,
       mimetype: 'image/jpeg',
-      summary: 'full-resolution JPEG',
+      summary: `${resLabel} full-resolution JPEG`,
     };
   }
 
   // Video handling: preserve exact original quality, resolution, and native FPS (e.g. 60 fps)
-  const meta = await probeMedia(inputPath);
-  if (!meta.hasVideo) {
-    throw new Error('Could not read a valid video stream from the quoted media.');
-  }
-
-  const resLabel = meta.width && meta.height ? `${meta.width}x${meta.height}` : 'native';
   const fpsLabel = meta.fps ? `${meta.fps} fps` : 'original fps';
   const isMp4Container = normalizedExt === '.mp4' || meta.formatName.includes('mp4');
   const audioOk = !meta.hasAudio || meta.audioCodec === 'aac';
@@ -752,6 +750,7 @@ async function prepareFullQualityStatusMedia({ inputPath, workDir, kind, ext, mi
   // Case 1: Already H.264 + AAC inside MP4 -> upload original bytes untouched (zero loss)
   if (meta.videoCodec === 'h264' && audioOk && isMp4Container) {
     return {
+      kind: 'video',
       finalPath: inputPath,
       mimetype: 'video/mp4',
       summary: `${resLabel} @ ${fpsLabel} (100% original untouched)`,
@@ -778,6 +777,7 @@ async function prepareFullQualityStatusMedia({ inputPath, workDir, kind, ext, mi
 
     await runCommand('ffmpeg', args);
     return {
+      kind: 'video',
       finalPath: outPath,
       mimetype: 'video/mp4',
       summary: `${resLabel} @ ${fpsLabel} (lossless remux)`,
@@ -808,6 +808,7 @@ async function prepareFullQualityStatusMedia({ inputPath, workDir, kind, ext, mi
 
   await runCommand('ffmpeg', args);
   return {
+    kind: 'video',
     finalPath: outPath,
     mimetype: 'video/mp4',
     summary: `${resLabel} @ ${fpsLabel} (full-quality H.264)`,
@@ -823,17 +824,18 @@ async function processStatusCommandJob(
   downloadMediaMessage,
   msg,
   contextInfo,
-  quotedMedia,
-  cmdCaption
+  targetMedia,
+  cmdCaption,
+  isDirectMedia = false
 ) {
   const jid = msg.key.remoteJid;
 
-  if (quotedMedia.fileLength > CONFIG.maxInputBytes) {
+  if (targetMedia.fileLength > CONFIG.maxInputBytes) {
     await safeSendMessage(
       sock,
       jid,
       {
-        text: `Quoted file is too large (${(quotedMedia.fileLength / 1024 / 1024).toFixed(1)} MB). Max allowed is ${(
+        text: `File is too large (${(targetMedia.fileLength / 1024 / 1024).toFixed(1)} MB). Max allowed is ${(
           CONFIG.maxInputBytes /
           1024 /
           1024
@@ -865,21 +867,33 @@ async function processStatusCommandJob(
 
   const workDir = path.join(os.tmpdir(), `wa-status-cmd-${crypto.randomUUID()}`);
   await fs.mkdir(workDir, { recursive: true });
-  const inputPath = path.join(workDir, `quoted${quotedMedia.ext}`);
+  const inputPath = path.join(workDir, `status_source${targetMedia.ext}`);
 
   try {
-    // Wrap the quoted media into a minimal WAMessage so Baileys can stream-download it
-    const quotedWAMsg = {
-      key: {
-        remoteJid: jid,
-        id: contextInfo.stanzaId,
-        participant: contextInfo.participant,
-      },
-      message: quotedMedia.message,
-    };
+    // Build the exact WAMessage structure Baileys needs to stream-download the media/file
+    const botSelfJid = normalizeUserJid(sock.user?.id);
+    const quotedSenderJid = normalizeUserJid(contextInfo?.participant);
+    const quotedFromMe = quotedSenderJid
+      ? quotedSenderJid === botSelfJid
+      : normalizeUserJid(jid) === botSelfJid;
+
+    const downloadTargetMsg = isDirectMedia
+      ? {
+          key: msg.key,
+          message: targetMedia.message,
+        }
+      : {
+          key: {
+            remoteJid: jid,
+            id: contextInfo.stanzaId,
+            fromMe: quotedFromMe,
+            participant: contextInfo.participant,
+          },
+          message: targetMedia.message,
+        };
 
     const mediaStream = await downloadMediaMessage(
-      quotedWAMsg,
+      downloadTargetMsg,
       'stream',
       {},
       {
@@ -892,15 +906,16 @@ async function processStatusCommandJob(
     const prepared = await prepareFullQualityStatusMedia({
       inputPath,
       workDir,
-      kind: quotedMedia.kind,
-      ext: quotedMedia.ext,
-      mimetype: quotedMedia.mimetype,
+      kind: targetMedia.kind,
+      ext: targetMedia.ext,
+      mimetype: targetMedia.mimetype,
     });
 
-    // Only attach a caption if the user provided one (on .status or on the quoted media)
-    const finalCaption = (cmdCaption || quotedMedia.caption || '').trim();
+    // Only attach a caption if the user actually provided one
+    const inheritedCaption = isDirectMedia ? '' : targetMedia.caption || '';
+    const finalCaption = (cmdCaption || inheritedCaption).trim();
     const statusPayload =
-      quotedMedia.kind === 'video'
+      prepared.kind === 'video'
         ? { video: { url: prepared.finalPath }, mimetype: prepared.mimetype }
         : { image: { url: prepared.finalPath }, mimetype: prepared.mimetype };
 
@@ -916,7 +931,7 @@ async function processStatusCommandJob(
     const stat = await fs.stat(prepared.finalPath);
     const sizeMb = (stat.size / 1024 / 1024).toFixed(2);
     logInfo(
-      `Published ${quotedMedia.kind} to status@broadcast (${prepared.summary}, ${sizeMb} MB, ${statusJidList.length} viewer JIDs)`
+      `Published ${prepared.kind} to status@broadcast (${prepared.summary}, ${sizeMb} MB, ${statusJidList.length} viewer JIDs)`
     );
 
     await safeSendMessage(
@@ -1204,7 +1219,31 @@ async function startBot() {
       addStatusJid(msg.key.remoteJid);
       addStatusJid(msg.key.remoteJidAlt);
 
-      // 1) Handle `.status` command (reply/quote a video, photo, or media file)
+      // 1) Handle `.status` put directly as the caption of a photo, video, or image/video file
+      const directMedia = extractMediaDescriptor(msg.message, true);
+      const directStatusMatch = directMedia?.caption
+        ? directMedia.caption.trim().match(/^\.status(?:\s+([\s\S]*))?$/i)
+        : null;
+      if (directStatusMatch) {
+        if (!msg.key.fromMe && !isAllowedSender(msg.key)) continue;
+
+        const cmdCaption = (directStatusMatch[1] || '').trim();
+        logInfo(`Queued direct .status (${directMedia.kind}) from ${msg.key.remoteJid}`);
+        enqueueJob(() =>
+          processStatusCommandJob(
+            sock,
+            downloadMediaMessage,
+            msg,
+            null,
+            directMedia,
+            cmdCaption,
+            true
+          )
+        );
+        continue;
+      }
+
+      // 2) Handle `.status` command replying to (quoting) a video, photo, or image/video file
       const { text, contextInfo } = extractTextAndContext(msg.message);
       const statusCmdMatch = text.trim().match(/^\.status(?:\s+([\s\S]*))?$/i);
       if (statusCmdMatch) {
@@ -1217,7 +1256,7 @@ async function startBot() {
             sock,
             msg.key.remoteJid,
             {
-              text: 'Reply to (quote) a video, photo, or media file with `.status` to post it to Status in full original quality.',
+              text: 'Reply to (quote) a video, photo, or image/video file with `.status` to post it to Status in full original quality.',
             },
             { quoted: msg }
           );
@@ -1225,7 +1264,7 @@ async function startBot() {
         }
 
         const cmdCaption = (statusCmdMatch[1] || '').trim();
-        logInfo(`Queued .status (${quotedMedia.kind}) from ${msg.key.remoteJid}`);
+        logInfo(`Queued quoted .status (${quotedMedia.kind}) from ${msg.key.remoteJid}`);
         enqueueJob(() =>
           processStatusCommandJob(
             sock,
@@ -1233,7 +1272,8 @@ async function startBot() {
             msg,
             contextInfo,
             quotedMedia,
-            cmdCaption
+            cmdCaption,
+            false
           )
         );
         continue;
@@ -1241,7 +1281,7 @@ async function startBot() {
 
       if (!isAllowedSender(msg.key)) continue;
 
-      // 2) Only handle Document/File uploads so WhatsApp doesn't compress the source
+      // 3) Auto-convert incoming Document/File uploads to Status-safe HD clips
       const docMsg = extractDocumentFromMessage(msg.message);
       if (!docMsg) continue;
 
