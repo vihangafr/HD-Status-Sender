@@ -15,7 +15,9 @@
  *    (or `.status your caption`) to post directly to your WhatsApp Status in
  *    full original quality and native FPS (e.g. 60 fps), honoring your
  *    WhatsApp Status privacy ("My contacts except...").
- * 5. Utility commands: `.menu`, `.ping`, `.runtime`, `.statusinfo`.
+ * 5. Reply/quote any regular (non-View Once) photo, video, audio, or file with
+ *    `.save` to copy it privately to your "Message yourself" inbox.
+ * 6. Utility commands: `.menu`, `.ping`, `.runtime`, `.statusinfo`.
  *
  * VPS SETUP (Ubuntu / Debian):
  *   sudo apt update && sudo apt install -y ffmpeg
@@ -245,6 +247,7 @@ function buildMenuText() {
     '• Automatically respects your WhatsApp Status privacy ("My contacts except...").',
     '',
     '*3. Utilities*',
+    '• `.save` — Reply to any regular (non-View Once) photo, video, audio, or file to copy it privately to your inbox.',
     '• `.statusinfo` — Check active Status privacy & viewer count.',
     '• `.ping` — Check bot & WhatsApp server latency.',
     '• `.runtime` — Check bot uptime, RAM usage & queue.',
@@ -598,6 +601,36 @@ function unwrapMessage(rawMessage) {
   return msg;
 }
 
+/**
+ * Checks whether a message is marked as View Once so ephemeral media is skipped.
+ */
+function isViewOnceMessage(rawMessage) {
+  if (!rawMessage) return false;
+  if (
+    rawMessage.viewOnceMessage ||
+    rawMessage.viewOnceMessageV2 ||
+    rawMessage.viewOnceMessageV2Extension
+  ) {
+    return true;
+  }
+
+  const unwrapped = unwrapMessage(rawMessage);
+  if (!unwrapped) return false;
+  if (
+    unwrapped.viewOnceMessage ||
+    unwrapped.viewOnceMessageV2 ||
+    unwrapped.viewOnceMessageV2Extension
+  ) {
+    return true;
+  }
+
+  return Boolean(
+    unwrapped.imageMessage?.viewOnce ||
+      unwrapped.videoMessage?.viewOnce ||
+      unwrapped.audioMessage?.viewOnce
+  );
+}
+
 function extractDocumentFromMessage(rawMessage) {
   const msg = unwrapMessage(rawMessage);
   return msg?.documentMessage || null;
@@ -695,8 +728,83 @@ function extractMediaDescriptor(rawMessage, allowProbeFallback = false) {
  */
 function extractQuotedMedia(contextInfo) {
   const rawQuoted = contextInfo?.quotedMessage;
-  if (!rawQuoted) return null;
+  if (!rawQuoted || isViewOnceMessage(rawQuoted)) return null;
   return extractMediaDescriptor(rawQuoted, true);
+}
+
+/**
+ * Extracts quoted regular (non-View Once) photo, video, audio, or document metadata for `.save`.
+ */
+function extractQuotedSavableMedia(contextInfo) {
+  const rawQuoted = contextInfo?.quotedMessage;
+  if (!rawQuoted) return null;
+
+  if (isViewOnceMessage(rawQuoted)) {
+    return { blockedViewOnce: true };
+  }
+
+  const unwrapped = unwrapMessage(rawQuoted);
+  if (!unwrapped) return null;
+
+  if (unwrapped.imageMessage) {
+    const mime = (unwrapped.imageMessage.mimetype || 'image/jpeg').toLowerCase();
+    const ext = mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : '.jpg';
+    return {
+      kind: 'image',
+      ext,
+      mimetype: mime,
+      caption: unwrapped.imageMessage.caption || '',
+      fileLength: Number(unwrapped.imageMessage.fileLength || 0),
+      message: { imageMessage: unwrapped.imageMessage },
+    };
+  }
+
+  if (unwrapped.videoMessage) {
+    return {
+      kind: 'video',
+      ext: '.mp4',
+      mimetype: unwrapped.videoMessage.mimetype || 'video/mp4',
+      caption: unwrapped.videoMessage.caption || '',
+      fileLength: Number(unwrapped.videoMessage.fileLength || 0),
+      message: { videoMessage: unwrapped.videoMessage },
+    };
+  }
+
+  if (unwrapped.audioMessage) {
+    const mime = (unwrapped.audioMessage.mimetype || 'audio/ogg; codecs=opus').toLowerCase();
+    const ext =
+      mime.includes('mpeg') || mime.includes('mp3')
+        ? '.mp3'
+        : mime.includes('mp4') || mime.includes('m4a') || mime.includes('aac')
+          ? '.m4a'
+          : '.ogg';
+    return {
+      kind: 'audio',
+      ext,
+      mimetype: unwrapped.audioMessage.mimetype || 'audio/ogg; codecs=opus',
+      ptt: Boolean(unwrapped.audioMessage.ptt),
+      caption: '',
+      fileLength: Number(unwrapped.audioMessage.fileLength || 0),
+      message: { audioMessage: unwrapped.audioMessage },
+    };
+  }
+
+  if (unwrapped.documentMessage) {
+    const docMsg = unwrapped.documentMessage;
+    const fileName = docMsg.fileName || docMsg.title || 'saved_file';
+    const ext = path.extname(fileName).toLowerCase() || '.bin';
+    return {
+      kind: 'document',
+      ext,
+      fileName,
+      mimetype: docMsg.mimetype || 'application/octet-stream',
+      caption: docMsg.caption || '',
+      fileLength: Number(docMsg.fileLength || 0),
+      message: { documentMessage: docMsg },
+    };
+  }
+
+  return null;
 }
 
 /**
@@ -1408,6 +1516,103 @@ async function processStatusCommandJob(
   }
 }
 
+/**
+ * Copies a quoted regular (non-View Once) photo, video, audio, or document privately
+ * to your own "Message yourself" inbox without posting anything in the original chat.
+ */
+async function processSaveMediaJob(
+  sock,
+  downloadMediaMessage,
+  msg,
+  contextInfo,
+  targetMedia,
+  cmdCaption
+) {
+  const sourceChatJid = msg.key.remoteJid;
+  const selfChatJid = getSelfChatJid(sock);
+  if (!selfChatJid) {
+    logError('Cannot run .save: unable to resolve self-chat JID.');
+    return;
+  }
+
+  if (targetMedia.fileLength > CONFIG.maxInputBytes) {
+    await safeSendMessage(sock, selfChatJid, {
+      text: `Cannot save file: too large (${(targetMedia.fileLength / 1024 / 1024).toFixed(1)} MB). Max allowed is ${(
+        CONFIG.maxInputBytes /
+        1024 /
+        1024
+      ).toFixed(0)} MB.`,
+    });
+    return;
+  }
+
+  const workDir = path.join(os.tmpdir(), `wa-save-${crypto.randomUUID()}`);
+  await fs.mkdir(workDir, { recursive: true });
+  const inputPath = path.join(workDir, `saved${targetMedia.ext}`);
+
+  try {
+    const botSelfIds = new Set(
+      [normalizeAnyJid(sock.user?.id), normalizeAnyJid(sock.user?.lid)].filter(Boolean)
+    );
+    const quotedSender = normalizeAnyJid(contextInfo?.participant);
+    const normalizedChatJid = normalizeAnyJid(sourceChatJid);
+    const quotedFromMe = quotedSender
+      ? botSelfIds.has(quotedSender)
+      : botSelfIds.has(normalizedChatJid);
+
+    const downloadTargetMsg = {
+      key: {
+        remoteJid: sourceChatJid,
+        id: contextInfo.stanzaId,
+        fromMe: quotedFromMe,
+        participant: contextInfo.participant,
+      },
+      message: targetMedia.message,
+    };
+
+    logInfo(`[.save] Downloading ${targetMedia.kind} from ${sourceChatJid} to self inbox...`);
+    await downloadMediaToFile(sock, downloadMediaMessage, downloadTargetMsg, inputPath);
+
+    const finalCaption = (cmdCaption || targetMedia.caption || '').trim();
+    let payload;
+
+    if (targetMedia.kind === 'image') {
+      payload = { image: { url: inputPath }, mimetype: targetMedia.mimetype };
+      if (finalCaption) payload.caption = finalCaption;
+    } else if (targetMedia.kind === 'video') {
+      payload = { video: { url: inputPath }, mimetype: targetMedia.mimetype };
+      if (finalCaption) payload.caption = finalCaption;
+    } else if (targetMedia.kind === 'audio') {
+      payload = {
+        audio: { url: inputPath },
+        mimetype: targetMedia.mimetype,
+        ptt: Boolean(targetMedia.ptt),
+      };
+    } else {
+      payload = {
+        document: { url: inputPath },
+        mimetype: targetMedia.mimetype,
+        fileName: targetMedia.fileName,
+      };
+      if (finalCaption) payload.caption = finalCaption;
+    }
+
+    await safeSendMessage(sock, selfChatJid, payload);
+    logInfo(`[.save] Saved ${targetMedia.kind} to self inbox (${selfChatJid}).`);
+  } catch (err) {
+    logError(`Failed .save command from ${sourceChatJid}`, err);
+    try {
+      await safeSendMessage(sock, selfChatJid, {
+        text: `Failed to save media: ${err.message}`,
+      });
+    } catch {
+      // Ignore secondary send error if socket disconnected mid-job
+    }
+  } finally {
+    await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 async function processDocumentJob(sock, downloadMediaMessage, msg, docMsg, classification) {
   const jid = msg.key.remoteJid;
   const caption = docMsg.caption || '';
@@ -1752,6 +1957,26 @@ async function startBot() {
             ].join('\n'),
           },
           replyOpts
+        );
+        continue;
+      }
+
+      const saveCmdMatch = trimmedText.match(/^\.save(?:\s+([\s\S]*))?$/i);
+      if (saveCmdMatch) {
+        const quotedSavable = extractQuotedSavableMedia(contextInfo);
+
+
+        const cmdCaption = (saveCmdMatch[1] || '').trim();
+        logInfo(`Queued .save (${quotedSavable.kind}) from ${msg.key.remoteJid}`);
+        enqueueJob(() =>
+          processSaveMediaJob(
+            sock,
+            downloadMediaMessage,
+            msg,
+            contextInfo,
+            quotedSavable,
+            cmdCaption
+          )
         );
         continue;
       }
