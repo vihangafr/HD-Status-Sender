@@ -728,7 +728,6 @@ function extractMediaDescriptor(rawMessage, allowProbeFallback = false) {
  */
 function extractQuotedMedia(contextInfo) {
   const rawQuoted = contextInfo?.quotedMessage;
-  if (!rawQuoted || isViewOnceMessage(rawQuoted)) return null;
   return extractMediaDescriptor(rawQuoted, true);
 }
 
@@ -738,11 +737,6 @@ function extractQuotedMedia(contextInfo) {
 function extractQuotedSavableMedia(contextInfo) {
   const rawQuoted = contextInfo?.quotedMessage;
   if (!rawQuoted) return null;
-
-  if (isViewOnceMessage(rawQuoted)) {
-    return { blockedViewOnce: true };
-  }
-
   const unwrapped = unwrapMessage(rawQuoted);
   if (!unwrapped) return null;
 
@@ -1964,7 +1958,29 @@ async function startBot() {
       const saveCmdMatch = trimmedText.match(/^\.save(?:\s+([\s\S]*))?$/i);
       if (saveCmdMatch) {
         const quotedSavable = extractQuotedSavableMedia(contextInfo);
+        if (quotedSavable?.blockedViewOnce) {
+          await safeSendMessage(
+            sock,
+            replyTargetJid,
+            {
+              text: 'View Once media is skipped and cannot be saved. `.save` works on regular photos, videos, audio, and files.',
+            },
+            replyOpts
+          );
+          continue;
+        }
 
+        if (!quotedSavable) {
+          await safeSendMessage(
+            sock,
+            replyTargetJid,
+            {
+              text: 'Reply to (quote) a regular photo, video, audio, or file with `.save` to copy it privately to your inbox.',
+            },
+            replyOpts
+          );
+          continue;
+        }
 
         const cmdCaption = (saveCmdMatch[1] || '').trim();
         logInfo(`Queued .save (${quotedSavable.kind}) from ${msg.key.remoteJid}`);
