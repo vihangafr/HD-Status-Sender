@@ -18,6 +18,7 @@
  *      - Photos sent as files are converted into crisp HD Status MP4 videos
  *        (default 7s; add e.g. "12s" in the file caption to change length).
  * 4. The bot sends the ready-to-post HD clip(s) back to your chat and
+ *    immediately deletes all temporary files from disk.
  * 5. Reply/quote any video, photo, or image/video file (document) with `.status`
  *    (or `.status your caption`) — or send a photo/video/file with `.status` as
  *    its caption — to publish it directly to the bot's own WhatsApp Status in
@@ -70,6 +71,32 @@ const CONFIG = {
     .map((n) => `${n}@s.whatsapp.net`),
   maxInputBytes: Number(process.env.MAX_INPUT_MB || 250) * 1024 * 1024,
   // WhatsApp Status re-compresses/rejects clips over ~16 MB; keep a safety margin.
+  maxOutputBytes: 15.4 * 1024 * 1024,
+  targetOutputMb: 14.8,
+  defaultPhotoDurationSec: Math.min(29, Math.max(3, Number(process.env.PHOTO_DURATION_SEC || 7))),
+  // WAstatus tested quality profiles
+  profiles: {
+    '1080p': {
+      name: '1080p HD',
+      maxShortEdge: 1080,
+      maxLongEdge: 1920,
+      partDurationSec: 29,
+      fps: 30,
+      crf: 20,
+      maxVideoBitrateKbps: 5500,
+    },
+    '720p': {
+      name: '720p Extended',
+      maxShortEdge: 720,
+      maxLongEdge: 1280,
+      partDurationSec: 59,
+      fps: 30,
+      crf: 21,
+      maxVideoBitrateKbps: 3000,
+    },
+  },
+};
+
 const VIDEO_EXTS = new Set([
   '.mp4',
   '.mov',
@@ -185,6 +212,59 @@ async function safeSendMessage(sock, jid, content, options = {}) {
   const sent = await sock.sendMessage(jid, content, options);
   rememberSentMessage(sent);
   return sent;
+}
+
+/**
+ * Normalizes an individual WhatsApp JID by stripping device suffixes (e.g. ":12")
+ * and keeping only standard "@s.whatsapp.net" user JIDs for Status broadcast delivery.
+ */
+function normalizeUserJid(jid) {
+  if (!jid || typeof jid !== 'string') return null;
+  if (
+    jid.endsWith('@g.us') ||
+    jid.endsWith('@newsletter') ||
+    jid.endsWith('@broadcast') ||
+    jid.endsWith('@lid')
+  ) {
+    return null;
+  }
+  const [userPart, domain] = jid.split('@');
+  if (!userPart || domain !== 's.whatsapp.net') return null;
+  const cleanUser = userPart.split(':')[0].replace(/\D/g, '');
+  return cleanUser ? `${cleanUser}@s.whatsapp.net` : null;
+}
+
+function addStatusJid(jid) {
+  const normalized = normalizeUserJid(jid);
+  if (normalized) {
+    knownStatusJids.add(normalized);
+  }
+}
+
+function collectStatusJidsFromItems(items) {
+  if (!Array.isArray(items)) return;
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    addStatusJid(item.id);
+    addStatusJid(item.jid);
+    if (typeof item.phoneNumber === 'string') {
+      const digits = item.phoneNumber.replace(/\D/g, '');
+      if (digits.length >= 7) {
+        addStatusJid(`${digits}@s.whatsapp.net`);
+      }
+    }
+  }
+}
+
+function getStatusJidList(sock, extraJids = []) {
+  const list = new Set(knownStatusJids);
+  const selfJid = normalizeUserJid(sock.user?.id);
+  if (selfJid) list.add(selfJid);
+  for (const jid of extraJids) {
+    const normalized = normalizeUserJid(jid);
+    if (normalized) list.add(normalized);
+  }
+  return Array.from(list);
 }
 
 /**
