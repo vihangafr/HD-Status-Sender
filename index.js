@@ -737,9 +737,10 @@ function extractQuotedMedia(contextInfo) {
 function extractQuotedSavableMedia(contextInfo) {
   const rawQuoted = contextInfo?.quotedMessage;
   if (!rawQuoted) return null;
+
   const unwrapped = unwrapMessage(rawQuoted);
   if (!unwrapped) return null;
-
+console.log(unwrapped)
   if (unwrapped.imageMessage) {
     const mime = (unwrapped.imageMessage.mimetype || 'image/jpeg').toLowerCase();
     const ext = mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : '.jpg';
