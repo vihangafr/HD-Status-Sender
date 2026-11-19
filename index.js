@@ -3,39 +3,30 @@
  * WAstatus-Style HD WhatsApp Status Bot (CommonJS, QR Scan, Zero-DB, VPS-Ready)
  * ============================================================================
  *
- * HOW IT WORKS:
+ * HOW IT WORKS (SELF-ONLY MODE):
  * 1. Start the bot on your VPS and scan the terminal QR code in WhatsApp
  *    (WhatsApp -> Linked Devices -> Link a Device).
- * 2. Send any video or photo to the chat as a FILE / DOCUMENT (📎 -> Document)
- *    so WhatsApp uploads the untouched original without pre-compression.
- * 3. This bot streams the file to a temporary folder on your VPS, encodes it
- *    with FFmpeg (libx264 + AAC) using WAstatus's Status-safe HD profile:
- *      - Default 1080p HD: max 1080x1920 (portrait) / 1920x1080 (landscape),
- *        30 fps (prevents 60 fps re-encoding), H.264 High/4.1, yuv420p,
- *        AAC 128k, auto-split into <= 29s clips, strictly under 15.4 MB.
- *      - Optional 720p Extended (add "720p" in file caption):
- *        max 720x1280, 30 fps, auto-split into <= 59s clips, under 15.4 MB.
- *      - Photos sent as files are converted into crisp HD Status MP4 videos
- *        (default 7s; add e.g. "12s" in the file caption to change length).
- * 4. The bot sends the ready-to-post HD clip(s) back to your chat and
- *    immediately deletes all temporary files from disk.
- * 5. Reply/quote any video, photo, or image/video file (document) with `.status`
- *    (or `.status your caption`) — or send a photo/video/file with `.status` as
- *    its caption — to publish it directly to the bot's own WhatsApp Status in
- *    full original quality and native FPS (e.g., 60 fps).
+ * 2. In your own "Message yourself" chat, send any video or photo as a
+ *    FILE / DOCUMENT (📎 -> Document) so WhatsApp uploads the untouched original.
+ * 3. This bot encodes it with FFmpeg (libx264 + AAC) using WAstatus's
+ *    Status-safe HD profile (1080p/30fps <= 29s, or add "720p" for 720p <= 59s,
+ *    strictly < 15.4 MB) and returns the ready-to-post clip(s) to your chat.
+ * 4. Reply/quote any video, photo, or image/video file with `.status`
+ *    (or `.status your caption`) to post directly to your WhatsApp Status in
+ *    full original quality and native FPS (e.g. 60 fps), honoring your
+ *    WhatsApp Status privacy ("My contacts except...").
+ * 5. Utility commands: `.menu`, `.ping`, `.runtime`, `.statusinfo`.
  *
  * VPS SETUP (Ubuntu / Debian):
  *   sudo apt update && sudo apt install -y ffmpeg
- *   mkdir wa-hd-bot && cd wa-hd-bot
- *   # Save this file as bot.js, then run:
  *   npm init -y
  *   npm install @whiskeysockets/baileys pino qrcode-terminal
  *   node bot.js
  *
  * OPTIONAL ENVIRONMENT VARIABLES:
- *   ALLOWED_NUMBERS=14155551234,919876543210  # Restrict to specific numbers (empty = allow all DMs)
  *   STATUS_CONTACTS=14155551234,919876543210  # Extra contacts always included in .status viewers
  *   STATUS_EXCEPT=14155551234,919876543210    # Extra contacts always excluded ("My contacts except...")
+ *   MIN_SEND_DELAY_MS=1200                    # Minimum pacing delay between outgoing messages
  *   FFMPEG_PRESET=veryfast                    # x264 speed preset (ultrafast|veryfast|fast|medium)
  *   PHOTO_DURATION_SEC=7                      # Default photo-to-video length in seconds (3..29)
  *   MAX_INPUT_MB=250                          # Max incoming document size accepted
@@ -79,6 +70,7 @@ const CONFIG = {
       .map((n) => `${n}@s.whatsapp.net`)
   ),
   ffmpegPreset: process.env.FFMPEG_PRESET || 'veryfast',
+  minSendDelayMs: Math.max(500, Number(process.env.MIN_SEND_DELAY_MS || 1200)),
   downloadTimeoutMs: Number(process.env.DOWNLOAD_TIMEOUT_MS || 120000),
   reuploadTimeoutMs: Number(process.env.REUPLOAD_TIMEOUT_MS || 20000),
   ffmpegTimeoutMs: Number(process.env.FFMPEG_TIMEOUT_MS || 300000),
@@ -158,6 +150,9 @@ let isProcessingQueue = false;
 let activeSocket = null;
 let isShuttingDown = false;
 let cachedBaileys = null;
+let reconnectAttempts = 0;
+let lastSendTimestamp = 0;
+const botStartedAt = Date.now();
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'silent' });
 
@@ -213,6 +208,81 @@ function logError(message, err) {
   console.error(`[${new Date().toISOString()}] [ERROR] ${message}`, err?.message || err || '');
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatRuntime(ms) {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+
+  const parts = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0 || days > 0) parts.push(`${hours}h`);
+  if (minutes > 0 || hours > 0 || days > 0) parts.push(`${minutes}m`);
+  parts.push(`${seconds}s`);
+  return parts.join(' ');
+}
+
+function buildMenuText() {
+  return [
+    '*HD Status Bot — User Manual*',
+    '_Mode: Self-Only (ignores all other users)_',
+    '',
+    '*1. HD Status Video Converter*',
+    '• In your *Message yourself* chat, send any video or photo as a *Document / File* (📎 → Document).',
+    '• Default: 1080p HD, 30 fps, auto-split ≤ 29s (< 16 MB).',
+    '• Add `720p` in file caption for 720p clips up to 59s.',
+    '• Add e.g. `12s` on a photo file to set video length (3–29s).',
+    '• Any other caption text is kept; empty caption stays empty.',
+    '',
+    '*2. Direct Full-Quality Status Post*',
+    '• `.status` — Reply to any video, photo, or image/video file (or put `.status` in its caption) to post directly to your Status at full original quality & FPS (including 60 fps).',
+    '• `.status Your caption` — Post with a custom caption.',
+    '• Automatically respects your WhatsApp Status privacy ("My contacts except...").',
+    '',
+    '*3. Utilities*',
+    '• `.statusinfo` — Check active Status privacy & viewer count.',
+    '• `.ping` — Check bot & WhatsApp server latency.',
+    '• `.runtime` — Check bot uptime, RAM usage & queue.',
+    '• `.menu` — Show this user manual.',
+  ].join('\n');
+}
+
+/**
+ * Measures real WhatsApp server round-trip latency via XMPP ping IQ,
+ * falling back to local event-loop latency if unavailable.
+ */
+async function measureWhatsAppPing(sock) {
+  const startHr = process.hrtime.bigint();
+  if (typeof sock.query === 'function') {
+    try {
+      await withTimeout(
+        sock.query({
+          tag: 'iq',
+          attrs: {
+            to: 's.whatsapp.net',
+            type: 'get',
+            xmlns: 'w:p',
+          },
+          content: [{ tag: 'ping', attrs: {} }],
+        }),
+        5000,
+        'WhatsApp ping'
+      );
+      const rttMs = Number(process.hrtime.bigint() - startHr) / 1e6;
+      return { ms: Math.round(rttMs), type: 'WhatsApp Server RTT' };
+    } catch {
+      // Fall back to local response measurement
+    }
+  }
+  const localMs = Number(process.hrtime.bigint() - startHr) / 1e6;
+  return { ms: Math.max(1, Math.round(localMs)), type: 'Bot Response' };
+}
+
 /**
  * Prevents hanging Baileys calls (e.g. updateMediaMessage / upload) from locking the queue.
  */
@@ -240,6 +310,13 @@ function rememberSentMessage(sentMsg) {
 }
 
 async function safeSendMessage(sock, jid, content, options = {}) {
+  // Pace outgoing messages to avoid burst-send patterns that can trigger account flags
+  const elapsed = Date.now() - lastSendTimestamp;
+  if (elapsed < CONFIG.minSendDelayMs) {
+    await sleep(CONFIG.minSendDelayMs - elapsed);
+  }
+  lastSendTimestamp = Date.now();
+
   const sent = await withTimeout(
     sock.sendMessage(jid, content, options),
     CONFIG.sendTimeoutMs,
@@ -247,6 +324,31 @@ async function safeSendMessage(sock, jid, content, options = {}) {
   );
   rememberSentMessage(sent);
   return sent;
+}
+
+/**
+ * Returns the bot owner's own chat JID ("Message yourself") for private notifications.
+ */
+function getSelfChatJid(sock) {
+  return normalizeUserJid(sock.user?.id) || normalizeAnyJid(sock.user?.lid);
+}
+
+/**
+ * Checks whether a message belongs to the owner's own "Message yourself" chat
+ * (handles both @s.whatsapp.net and @lid addressing).
+ */
+function isSelfChat(sock, msgKey) {
+  const selfIds = new Set(
+    [normalizeAnyJid(sock.user?.id), normalizeAnyJid(sock.user?.lid)].filter(Boolean)
+  );
+  if (selfIds.size === 0) return false;
+
+  const chatIds = [
+    normalizeAnyJid(msgKey?.remoteJid),
+    normalizeAnyJid(msgKey?.remoteJidAlt),
+  ].filter(Boolean);
+
+  return chatIds.some((id) => selfIds.has(id));
 }
 
 /**
@@ -475,7 +577,7 @@ async function resolveStatusAudience(sock, extraJids = []) {
 }
 
 /**
- * Recursively unwraps ephemeral / view-once / documentWithCaption / edited envelopes.
+ * Recursively unwraps ephemeral / documentWithCaption / edited envelopes.
  */
 function unwrapMessage(rawMessage) {
   let msg = rawMessage;
@@ -484,12 +586,6 @@ function unwrapMessage(rawMessage) {
   for (let i = 0; i < 6 && msg; i++) {
     if (msg.ephemeralMessage?.message) {
       msg = msg.ephemeralMessage.message;
-    } else if (msg.viewOnceMessage?.message) {
-      msg = msg.viewOnceMessage.message;
-    } else if (msg.viewOnceMessageV2?.message) {
-      msg = msg.viewOnceMessageV2.message;
-    } else if (msg.viewOnceMessageV2Extension?.message) {
-      msg = msg.viewOnceMessageV2Extension.message;
     } else if (msg.documentWithCaptionMessage?.message) {
       msg = msg.documentWithCaptionMessage.message;
     } else if (msg.editedMessage?.message?.protocolMessage?.editedMessage) {
@@ -1174,12 +1270,17 @@ async function processStatusCommandJob(
   cmdCaption,
   isDirectMedia = false
 ) {
-  const jid = msg.key.remoteJid;
+  const sourceChatJid = msg.key.remoteJid;
+  // Always send bot confirmations to your own self-chat so the bot never messages other chats
+  const notifyJid = isSelfChat(sock, msg.key)
+    ? sourceChatJid
+    : getSelfChatJid(sock) || sourceChatJid;
+  const replyOpts = notifyJid === sourceChatJid ? { quoted: msg } : {};
 
   if (targetMedia.fileLength > CONFIG.maxInputBytes) {
     await safeSendMessage(
       sock,
-      jid,
+      notifyJid,
       {
         text: `File is too large (${(targetMedia.fileLength / 1024 / 1024).toFixed(1)} MB). Max allowed is ${(
           CONFIG.maxInputBytes /
@@ -1187,7 +1288,7 @@ async function processStatusCommandJob(
           1024
         ).toFixed(0)} MB.`,
       },
-      { quoted: msg }
+      replyOpts
     );
     return;
   }
@@ -1197,7 +1298,7 @@ async function processStatusCommandJob(
   const inputPath = path.join(workDir, `status_source${targetMedia.ext}`);
 
   try {
-    logInfo(`[.status] Step 1/4: Resolving WhatsApp Status privacy & audience for ${jid}...`);
+    logInfo(`[.status] Step 1/4: Resolving WhatsApp Status privacy & audience for ${sourceChatJid}...`);
     const audience = await resolveStatusAudience(sock, [
       msg.key.remoteJid,
       msg.key.remoteJidAlt,
@@ -1208,11 +1309,11 @@ async function processStatusCommandJob(
     if (audience.statusJidList.length === 0) {
       await safeSendMessage(
         sock,
-        jid,
+        notifyJid,
         {
           text: 'Cannot publish Status yet: no contact JIDs are available. Set STATUS_CONTACTS or wait for WhatsApp contacts to sync.',
         },
-        { quoted: msg }
+        replyOpts
       );
       return;
     }
@@ -1222,7 +1323,7 @@ async function processStatusCommandJob(
       [normalizeAnyJid(sock.user?.id), normalizeAnyJid(sock.user?.lid)].filter(Boolean)
     );
     const quotedSender = normalizeAnyJid(contextInfo?.participant);
-    const normalizedChatJid = normalizeAnyJid(jid);
+    const normalizedChatJid = normalizeAnyJid(sourceChatJid);
     const quotedFromMe = quotedSender
       ? botSelfIds.has(quotedSender)
       : botSelfIds.has(normalizedChatJid);
@@ -1234,7 +1335,7 @@ async function processStatusCommandJob(
         }
       : {
           key: {
-            remoteJid: jid,
+            remoteJid: sourceChatJid,
             id: contextInfo.stanzaId,
             fromMe: quotedFromMe,
             participant: contextInfo.participant,
@@ -1284,20 +1385,20 @@ async function processStatusCommandJob(
       audience.excludedCount > 0 ? `, ${audience.excludedCount} excluded` : '';
     await safeSendMessage(
       sock,
-      jid,
+      notifyJid,
       {
         text: `Posted to bot Status in full quality (${prepared.summary}, ${sizeMb} MB) • Privacy: ${audience.privacyLabel} (${audience.statusJidList.length} viewer(s)${exceptNote}).`,
       },
-      { quoted: msg }
+      replyOpts
     );
   } catch (err) {
-    logError(`Failed .status command from ${jid}`, err);
+    logError(`Failed .status command from ${sourceChatJid}`, err);
     try {
       await safeSendMessage(
         sock,
-        jid,
+        notifyJid,
         { text: `Failed to post Status: ${err.message}` },
-        { quoted: msg }
+        replyOpts
       );
     } catch {
       // Ignore secondary send error if socket disconnected mid-job
@@ -1525,9 +1626,10 @@ async function startBot() {
     }
 
     if (connection === 'open') {
+      reconnectAttempts = 0;
       addStatusJid(sock.user?.id);
       logInfo(
-        'Connected to WhatsApp! Send a video/photo as a File to convert it, or reply to media with .status to post directly.'
+        'Connected to WhatsApp (SELF-ONLY mode)! Send .menu in "Message yourself" to see all commands.'
       );
     }
 
@@ -1538,9 +1640,13 @@ async function startBot() {
       logInfo(`Connection closed (code: ${statusCode ?? 'unknown'}). Reconnect: ${shouldReconnect}`);
 
       if (shouldReconnect) {
+        // Exponential backoff (4s -> 8s -> 16s -> ... max 60s) prevents rapid reconnect loops
+        const delayMs = Math.min(60000, 4000 * Math.pow(2, reconnectAttempts));
+        reconnectAttempts += 1;
+        logInfo(`Reconnecting in ${(delayMs / 1000).toFixed(0)}s (attempt ${reconnectAttempts})...`);
         setTimeout(() => {
           startBot().catch((err) => logError('Reconnect failed', err));
-        }, 4000);
+        }, delayMs);
       } else if (statusCode === DisconnectReason.loggedOut) {
         logInfo(
           `Logged out. Delete "${CONFIG.authDir}" and restart to scan a new QR code.`
@@ -1556,9 +1662,18 @@ async function startBot() {
       if (!msg?.message) continue;
       if (botSentMessageIds.has(msg.key.id)) continue;
 
-      // Remember DM contacts in memory for status@broadcast delivery
+      // Passively remember DM contacts in memory for status@broadcast delivery
       addStatusJid(msg.key.remoteJid);
       addStatusJid(msg.key.remoteJidAlt);
+
+      // STRICT SELF-ONLY MODE: Never respond to or process messages from anyone else
+      if (!msg.key.fromMe) continue;
+
+      const inSelfChat = isSelfChat(sock, msg.key);
+      const replyTargetJid = inSelfChat
+        ? msg.key.remoteJid
+        : getSelfChatJid(sock) || msg.key.remoteJid;
+      const replyOpts = replyTargetJid === msg.key.remoteJid ? { quoted: msg } : {};
 
       // 1) Handle `.status` put directly as the caption of a photo, video, or image/video file
       const directMedia = extractMediaDescriptor(msg.message, true);
@@ -1566,8 +1681,6 @@ async function startBot() {
         ? directMedia.caption.trim().match(/^\.status(?:\s+([\s\S]*))?$/i)
         : null;
       if (directStatusMatch) {
-        if (!msg.key.fromMe && !isAllowedSender(msg.key)) continue;
-
         const cmdCaption = (directStatusMatch[1] || '').trim();
         logInfo(`Queued direct .status (${directMedia.kind}) from ${msg.key.remoteJid}`);
         enqueueJob(() =>
@@ -1584,16 +1697,52 @@ async function startBot() {
         continue;
       }
 
-      // 2) Handle `.status` command replying to (quoting) a video, photo, or image/video file
+      // 2) Handle text commands (`.menu`, `.ping`, `.runtime`, `.statusinfo`, `.status`)
       const { text, contextInfo } = extractTextAndContext(msg.message);
+      const trimmedText = text.trim();
+      const cmdLower = trimmedText.toLowerCase();
 
-      // Quick diagnostic command to verify contacts & "My contacts except..." exclusion list
-      if (text.trim().toLowerCase() === '.statusinfo') {
-        if (!msg.key.fromMe && !isAllowedSender(msg.key)) continue;
+      if (cmdLower === '.menu' || cmdLower === '.help') {
+        await safeSendMessage(sock, replyTargetJid, { text: buildMenuText() }, replyOpts);
+        continue;
+      }
+
+      if (cmdLower === '.ping') {
+        const pingResult = await measureWhatsAppPing(sock);
+        await safeSendMessage(
+          sock,
+          replyTargetJid,
+          { text: `Pong!\n${pingResult.type}: ${pingResult.ms} ms` },
+          replyOpts
+        );
+        continue;
+      }
+
+      if (cmdLower === '.runtime') {
+        const uptimeStr = formatRuntime(Date.now() - botStartedAt);
+        const memMb = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
+        await safeSendMessage(
+          sock,
+          replyTargetJid,
+          {
+            text: [
+              '*Bot Runtime*',
+              `Uptime: ${uptimeStr}`,
+              `RAM Usage: ${memMb} MB`,
+              `Queued Jobs: ${jobQueue.length}`,
+              'Mode: Self-Only',
+            ].join('\n'),
+          },
+          replyOpts
+        );
+        continue;
+      }
+
+      if (cmdLower === '.statusinfo') {
         const audience = await resolveStatusAudience(sock);
         await safeSendMessage(
           sock,
-          msg.key.remoteJid,
+          replyTargetJid,
           {
             text: [
               `Status Privacy: ${audience.privacyLabel}`,
@@ -1602,25 +1751,22 @@ async function startBot() {
               `Viewers who will receive .status: ${audience.statusJidList.length}`,
             ].join('\n'),
           },
-          { quoted: msg }
+          replyOpts
         );
         continue;
       }
 
-      const statusCmdMatch = text.trim().match(/^\.status(?:\s+([\s\S]*))?$/i);
+      const statusCmdMatch = trimmedText.match(/^\.status(?:\s+([\s\S]*))?$/i);
       if (statusCmdMatch) {
-        // Allow bot owner anywhere (including groups/self-chat) or allowed DM senders
-        if (!msg.key.fromMe && !isAllowedSender(msg.key)) continue;
-
         const quotedMedia = extractQuotedMedia(contextInfo);
         if (!quotedMedia) {
           await safeSendMessage(
             sock,
-            msg.key.remoteJid,
+            replyTargetJid,
             {
               text: 'Reply to (quote) a video, photo, or image/video file with `.status` to post it to Status in full original quality.',
             },
-            { quoted: msg }
+            replyOpts
           );
           continue;
         }
@@ -1641,9 +1787,9 @@ async function startBot() {
         continue;
       }
 
-      if (!isAllowedSender(msg.key)) continue;
+      // 3) Auto-convert incoming Document/File uploads ONLY inside your "Message yourself" chat
+      if (!inSelfChat) continue;
 
-      // 3) Auto-convert incoming Document/File uploads to Status-safe HD clips
       const docMsg = extractDocumentFromMessage(msg.message);
       if (!docMsg) continue;
 
