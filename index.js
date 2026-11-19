@@ -740,7 +740,7 @@ function extractQuotedSavableMedia(contextInfo) {
 
   const unwrapped = unwrapMessage(rawQuoted);
   if (!unwrapped) return null;
-console.log(rawQuoted)
+console.log(contextInfo)
   if (unwrapped.imageMessage) {
     const mime = (unwrapped.imageMessage.mimetype || 'image/jpeg').toLowerCase();
     const ext = mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : '.jpg';
