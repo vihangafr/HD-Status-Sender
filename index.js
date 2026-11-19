@@ -35,6 +35,8 @@
  * OPTIONAL ENVIRONMENT VARIABLES:
  *   ALLOWED_NUMBERS=14155551234,919876543210  # Restrict to specific numbers (empty = allow all DMs)
  *   STATUS_CONTACTS=14155551234,919876543210  # Extra contacts always included in .status viewers
+ *   STATUS_EXCEPT=14155551234,919876543210    # Extra contacts always excluded ("My contacts except...")
+ *   FFMPEG_PRESET=veryfast                    # x264 speed preset (ultrafast|veryfast|fast|medium)
  *   PHOTO_DURATION_SEC=7                      # Default photo-to-video length in seconds (3..29)
  *   MAX_INPUT_MB=250                          # Max incoming document size accepted
  *   AUTH_DIR=./auth_info                      # Folder where WhatsApp session files are saved
@@ -69,6 +71,18 @@ const CONFIG = {
     .map((n) => n.replace(/\D/g, ''))
     .filter(Boolean)
     .map((n) => `${n}@s.whatsapp.net`),
+  statusExcept: new Set(
+    (process.env.STATUS_EXCEPT || '')
+      .split(',')
+      .map((n) => n.replace(/\D/g, ''))
+      .filter(Boolean)
+      .map((n) => `${n}@s.whatsapp.net`)
+  ),
+  ffmpegPreset: process.env.FFMPEG_PRESET || 'veryfast',
+  downloadTimeoutMs: Number(process.env.DOWNLOAD_TIMEOUT_MS || 120000),
+  reuploadTimeoutMs: Number(process.env.REUPLOAD_TIMEOUT_MS || 20000),
+  ffmpegTimeoutMs: Number(process.env.FFMPEG_TIMEOUT_MS || 300000),
+  sendTimeoutMs: Number(process.env.SEND_TIMEOUT_MS || 120000),
   maxInputBytes: Number(process.env.MAX_INPUT_MB || 250) * 1024 * 1024,
   // WhatsApp Status re-compresses/rejects clips over ~16 MB; keep a safety margin.
   maxOutputBytes: 15.4 * 1024 * 1024,
@@ -135,6 +149,8 @@ const knownStatusJids = new Set([
   ...CONFIG.statusContacts,
   ...Array.from(CONFIG.allowedNumbers, (n) => `${n}@s.whatsapp.net`),
 ]);
+const CONTACTS_CACHE_FILE = path.join(CONFIG.authDir, 'status-contacts.json');
+let contactsCacheSaveTimer = null;
 
 // Sequential in-memory queue so a small VPS never runs competing FFmpeg processes
 const jobQueue = [];
@@ -197,6 +213,21 @@ function logError(message, err) {
   console.error(`[${new Date().toISOString()}] [ERROR] ${message}`, err?.message || err || '');
 }
 
+/**
+ * Prevents hanging Baileys calls (e.g. updateMediaMessage / upload) from locking the queue.
+ */
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`));
+      }, ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 function rememberSentMessage(sentMsg) {
   const id = sentMsg?.key?.id;
   if (!id) return;
@@ -209,9 +240,24 @@ function rememberSentMessage(sentMsg) {
 }
 
 async function safeSendMessage(sock, jid, content, options = {}) {
-  const sent = await sock.sendMessage(jid, content, options);
+  const sent = await withTimeout(
+    sock.sendMessage(jid, content, options),
+    CONFIG.sendTimeoutMs,
+    `sendMessage(${jid})`
+  );
   rememberSentMessage(sent);
   return sent;
+}
+
+/**
+ * Strips device suffixes (e.g. ":12") while keeping "@s.whatsapp.net" or "@lid" domain.
+ */
+function normalizeAnyJid(jid) {
+  if (!jid || typeof jid !== 'string') return null;
+  const [userPart, domain] = jid.split('@');
+  if (!userPart || !domain) return null;
+  const cleanUser = userPart.split(':')[0].trim();
+  return cleanUser ? `${cleanUser}@${domain}` : null;
 }
 
 /**
@@ -234,10 +280,44 @@ function normalizeUserJid(jid) {
   return cleanUser ? `${cleanUser}@s.whatsapp.net` : null;
 }
 
+async function loadContactsCache() {
+  try {
+    const raw = await fs.readFile(CONTACTS_CACHE_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      for (const jid of parsed) {
+        const normalized = normalizeUserJid(jid);
+        if (normalized) knownStatusJids.add(normalized);
+      }
+      logInfo(`Loaded ${knownStatusJids.size} cached contact JID(s) from ${CONTACTS_CACHE_FILE}`);
+    }
+  } catch {
+    // Cache file does not exist yet on first run
+  }
+}
+
+function scheduleContactsCacheSave() {
+  if (contactsCacheSaveTimer) return;
+  contactsCacheSaveTimer = setTimeout(async () => {
+    contactsCacheSaveTimer = null;
+    try {
+      await fs.mkdir(CONFIG.authDir, { recursive: true });
+      await fs.writeFile(
+        CONTACTS_CACHE_FILE,
+        JSON.stringify(Array.from(knownStatusJids), null, 2),
+        'utf8'
+      );
+    } catch (err) {
+      logError('Failed saving contacts cache', err);
+    }
+  }, 2500);
+}
+
 function addStatusJid(jid) {
   const normalized = normalizeUserJid(jid);
-  if (normalized) {
+  if (normalized && !knownStatusJids.has(normalized)) {
     knownStatusJids.add(normalized);
+    scheduleContactsCacheSave();
   }
 }
 
@@ -256,15 +336,142 @@ function collectStatusJidsFromItems(items) {
   }
 }
 
-function getStatusJidList(sock, extraJids = []) {
-  const list = new Set(knownStatusJids);
-  const selfJid = normalizeUserJid(sock.user?.id);
-  if (selfJid) list.add(selfJid);
-  for (const jid of extraJids) {
-    const normalized = normalizeUserJid(jid);
-    if (normalized) list.add(normalized);
+/**
+ * Resolves a phone-number JID or LID to a canonical "@s.whatsapp.net" JID when possible.
+ */
+async function resolveToPhoneJid(sock, jid) {
+  const pn = normalizeUserJid(jid);
+  if (pn) return pn;
+
+  const lid = normalizeAnyJid(jid);
+  if (lid && lid.endsWith('@lid')) {
+    try {
+      const mapped = await sock.signalRepository?.lidMapping?.getPNForLID?.(lid);
+      const normalizedMapped = normalizeUserJid(mapped);
+      if (normalizedMapped) return normalizedMapped;
+    } catch {
+      // Ignore LID mapping lookup errors
+    }
   }
-  return Array.from(list);
+  return null;
+}
+
+/**
+ * Queries WhatsApp's native Status privacy list ("My contacts", "My contacts except...",
+ * or "Only share with...") directly from WhatsApp servers via IQ stanza.
+ */
+async function fetchStatusPrivacy(sock) {
+  const fallback = { type: 'contacts', list: [], source: 'fallback' };
+  if (typeof sock.query !== 'function') {
+    return fallback;
+  }
+
+  try {
+    const resp = await withTimeout(
+      sock.query({
+        tag: 'iq',
+        attrs: {
+          to: 's.whatsapp.net',
+          type: 'get',
+          xmlns: 'status',
+        },
+        content: [{ tag: 'privacy', attrs: {} }],
+      }),
+      15000,
+      'Fetch WhatsApp status privacy'
+    );
+
+    const topContent = Array.isArray(resp?.content) ? resp.content : [];
+    const privacyNode = topContent.find((n) => n?.tag === 'privacy');
+    const lists = Array.isArray(privacyNode?.content)
+      ? privacyNode.content.filter((n) => n?.tag === 'list')
+      : [];
+
+    if (lists.length === 0) {
+      return { type: 'contacts', list: [], source: 'whatsapp' };
+    }
+
+    // WhatsApp marks the currently active Status privacy setting with default="true"
+    const activeList =
+      lists.find((l) => l?.attrs?.default === 'true' || l?.attrs?.default === true) || lists[0];
+    const privacyType = String(activeList?.attrs?.type || 'contacts').toLowerCase();
+    const userNodes = Array.isArray(activeList?.content) ? activeList.content : [];
+    const rawJids = userNodes
+      .filter((n) => n?.tag === 'user' && n?.attrs?.jid)
+      .map((n) => String(n.attrs.jid));
+
+    return {
+      type: privacyType,
+      list: rawJids,
+      source: 'whatsapp',
+    };
+  } catch (err) {
+    logError('Could not fetch WhatsApp status privacy (using contacts + STATUS_EXCEPT)', err);
+    return fallback;
+  }
+}
+
+/**
+ * Builds the exact statusJidList honoring WhatsApp's "My contacts except..." (blacklist),
+ * "Only share with..." (whitelist), or "My contacts" setting + optional STATUS_EXCEPT env.
+ */
+async function resolveStatusAudience(sock, extraJids = []) {
+  const privacy = await fetchStatusPrivacy(sock);
+  const selfJid = normalizeUserJid(sock.user?.id);
+
+  // Resolve privacy list entries (handles both @s.whatsapp.net and @lid entries)
+  const resolvedPrivacyJids = new Set();
+  for (const rawJid of privacy.list) {
+    const pn = await resolveToPhoneJid(sock, rawJid);
+    if (pn) resolvedPrivacyJids.add(pn);
+  }
+
+  const excludedSet = new Set(CONFIG.statusExcept);
+  if (privacy.type === 'blacklist') {
+    for (const jid of resolvedPrivacyJids) {
+      excludedSet.add(jid);
+    }
+  }
+
+  const audience = new Set();
+  if (privacy.type === 'whitelist') {
+    for (const jid of resolvedPrivacyJids) {
+      if (!CONFIG.statusExcept.has(jid)) {
+        audience.add(jid);
+      }
+    }
+  } else {
+    // "contacts" or "blacklist" ("My contacts except...")
+    for (const jid of knownStatusJids) {
+      if (!excludedSet.has(jid)) {
+        audience.add(jid);
+      }
+    }
+    for (const rawExtra of extraJids) {
+      const pn = await resolveToPhoneJid(sock, rawExtra);
+      if (pn && !excludedSet.has(pn)) {
+        audience.add(pn);
+      }
+    }
+  }
+
+  // Always include self JID so you can see your own posted Status in WhatsApp
+  if (selfJid) {
+    audience.add(selfJid);
+  }
+
+  const labelMap = {
+    blacklist: 'My contacts except...',
+    whitelist: 'Only share with...',
+    contacts: 'My contacts',
+  };
+
+  return {
+    statusJidList: Array.from(audience),
+    privacyType: privacy.type,
+    privacyLabel: labelMap[privacy.type] || privacy.type,
+    excludedCount: excludedSet.size,
+  };
 }
 
 /**
@@ -541,11 +748,24 @@ function isAllowedSender(msgKey) {
 // FFmpeg / FFprobe Execution Helpers
 // ----------------------------------------------------------------------------
 
-function runCommand(binary, args) {
+function runCommand(binary, args, timeoutMs = CONFIG.ffmpegTimeoutMs) {
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill('SIGTERM');
+        setTimeout(() => child.kill('SIGKILL'), 3000).unref();
+      } catch {
+        // Ignore kill error
+      }
+      reject(new Error(`${binary} timed out after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
 
     child.stdout.on('data', (chunk) => {
       stdout += chunk.toString();
@@ -555,10 +775,16 @@ function runCommand(binary, args) {
     });
 
     child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       reject(new Error(`Failed to start ${binary}: ${err.message}`));
     });
 
     child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
@@ -567,6 +793,46 @@ function runCommand(binary, args) {
       }
     });
   });
+}
+
+/**
+ * Downloads media safely with strict timeouts on both download and Baileys reuploadRequest
+ * so an unresponsive phone/CDN can never freeze the job queue forever.
+ */
+async function downloadMediaToFile(sock, downloadMediaMessage, targetMsg, outputPath) {
+  const safeReuploadRequest = (m) =>
+    withTimeout(
+      sock.updateMediaMessage(m),
+      CONFIG.reuploadTimeoutMs,
+      'Media re-upload request'
+    );
+
+  const mediaStream = await withTimeout(
+    downloadMediaMessage(
+      targetMsg,
+      'stream',
+      {},
+      {
+        logger,
+        reuploadRequest: safeReuploadRequest,
+      }
+    ),
+    CONFIG.downloadTimeoutMs,
+    'Start media download'
+  );
+
+  const writeStream = createWriteStream(outputPath);
+  try {
+    await withTimeout(
+      pipeline(mediaStream, writeStream),
+      CONFIG.downloadTimeoutMs,
+      'Media download stream'
+    );
+  } catch (err) {
+    mediaStream.destroy();
+    writeStream.destroy();
+    throw err;
+  }
 }
 
 async function verifyFfmpegInstalled() {
@@ -645,7 +911,7 @@ async function encodeVideoSegment({
       '-c:v',
       'libx264',
       '-preset',
-      'medium',
+      CONFIG.ffmpegPreset,
       '-profile:v',
       'high',
       '-level',
@@ -744,7 +1010,7 @@ async function encodePhotoToStatusVideo({ inputPath, outputPath, durationSec, pr
     '-c:v',
     'libx264',
     '-preset',
-    'medium',
+    CONFIG.ffmpegPreset,
     '-tune',
     'stillimage',
     '-crf',
@@ -873,7 +1139,7 @@ async function prepareFullQualityStatusMedia({ inputPath, workDir, kind, ext, mi
     '-c:v',
     'libx264',
     '-preset',
-    'medium',
+    CONFIG.ffmpegPreset,
     '-crf',
     '16',
     '-profile:v',
@@ -926,36 +1192,40 @@ async function processStatusCommandJob(
     return;
   }
 
-  const statusJidList = getStatusJidList(sock, [
-    msg.key.remoteJid,
-    msg.key.remoteJidAlt,
-    msg.key.participant,
-    msg.key.participantAlt,
-  ]);
-
-  if (statusJidList.length === 0) {
-    await safeSendMessage(
-      sock,
-      jid,
-      {
-        text: 'Cannot publish Status yet: no contact JIDs are available. Set STATUS_CONTACTS or wait for WhatsApp contacts to sync.',
-      },
-      { quoted: msg }
-    );
-    return;
-  }
-
   const workDir = path.join(os.tmpdir(), `wa-status-cmd-${crypto.randomUUID()}`);
   await fs.mkdir(workDir, { recursive: true });
   const inputPath = path.join(workDir, `status_source${targetMedia.ext}`);
 
   try {
+    logInfo(`[.status] Step 1/4: Resolving WhatsApp Status privacy & audience for ${jid}...`);
+    const audience = await resolveStatusAudience(sock, [
+      msg.key.remoteJid,
+      msg.key.remoteJidAlt,
+      msg.key.participant,
+      msg.key.participantAlt,
+    ]);
+
+    if (audience.statusJidList.length === 0) {
+      await safeSendMessage(
+        sock,
+        jid,
+        {
+          text: 'Cannot publish Status yet: no contact JIDs are available. Set STATUS_CONTACTS or wait for WhatsApp contacts to sync.',
+        },
+        { quoted: msg }
+      );
+      return;
+    }
+
     // Build the exact WAMessage structure Baileys needs to stream-download the media/file
-    const botSelfJid = normalizeUserJid(sock.user?.id);
-    const quotedSenderJid = normalizeUserJid(contextInfo?.participant);
-    const quotedFromMe = quotedSenderJid
-      ? quotedSenderJid === botSelfJid
-      : normalizeUserJid(jid) === botSelfJid;
+    const botSelfIds = new Set(
+      [normalizeAnyJid(sock.user?.id), normalizeAnyJid(sock.user?.lid)].filter(Boolean)
+    );
+    const quotedSender = normalizeAnyJid(contextInfo?.participant);
+    const normalizedChatJid = normalizeAnyJid(jid);
+    const quotedFromMe = quotedSender
+      ? botSelfIds.has(quotedSender)
+      : botSelfIds.has(normalizedChatJid);
 
     const downloadTargetMsg = isDirectMedia
       ? {
@@ -972,17 +1242,10 @@ async function processStatusCommandJob(
           message: targetMedia.message,
         };
 
-    const mediaStream = await downloadMediaMessage(
-      downloadTargetMsg,
-      'stream',
-      {},
-      {
-        logger,
-        reuploadRequest: sock.updateMediaMessage,
-      }
-    );
-    await pipeline(mediaStream, createWriteStream(inputPath));
+    logInfo(`[.status] Step 2/4: Downloading ${targetMedia.kind} media...`);
+    await downloadMediaToFile(sock, downloadMediaMessage, downloadTargetMsg, inputPath);
 
+    logInfo(`[.status] Step 3/4: Probing & preparing full-quality ${targetMedia.kind}...`);
     const prepared = await prepareFullQualityStatusMedia({
       inputPath,
       workDir,
@@ -1003,22 +1266,27 @@ async function processStatusCommandJob(
       statusPayload.caption = finalCaption;
     }
 
+    logInfo(
+      `[.status] Step 4/4: Uploading to status@broadcast (${audience.privacyLabel}, ${audience.statusJidList.length} viewer(s), ${audience.excludedCount} excluded)...`
+    );
     await safeSendMessage(sock, 'status@broadcast', statusPayload, {
       broadcast: true,
-      statusJidList,
+      statusJidList: audience.statusJidList,
     });
 
     const stat = await fs.stat(prepared.finalPath);
     const sizeMb = (stat.size / 1024 / 1024).toFixed(2);
     logInfo(
-      `Published ${prepared.kind} to status@broadcast (${prepared.summary}, ${sizeMb} MB, ${statusJidList.length} viewer JIDs)`
+      `Published ${prepared.kind} to status@broadcast (${prepared.summary}, ${sizeMb} MB, ${audience.privacyLabel}, ${audience.statusJidList.length} viewer(s), ${audience.excludedCount} excluded)`
     );
 
+    const exceptNote =
+      audience.excludedCount > 0 ? `, ${audience.excludedCount} excluded` : '';
     await safeSendMessage(
       sock,
       jid,
       {
-        text: `Posted to bot Status in full quality (${prepared.summary}, ${sizeMb} MB) for ${statusJidList.length} contact(s).`,
+        text: `Posted to bot Status in full quality (${prepared.summary}, ${sizeMb} MB) • Privacy: ${audience.privacyLabel} (${audience.statusJidList.length} viewer(s)${exceptNote}).`,
       },
       { quoted: msg }
     );
@@ -1085,16 +1353,8 @@ async function processDocumentJob(sock, downloadMediaMessage, msg, docMsg, class
     );
 
     // Stream incoming document directly to disk (keeps VPS RAM usage low)
-    const mediaStream = await downloadMediaMessage(
-      msg,
-      'stream',
-      {},
-      {
-        logger,
-        reuploadRequest: sock.updateMediaMessage,
-      }
-    );
-    await pipeline(mediaStream, createWriteStream(inputPath));
+    logInfo(`[document] Downloading "${docMsg.fileName || 'unnamed'}" from ${jid}...`);
+    await downloadMediaToFile(sock, downloadMediaMessage, msg, inputPath);
 
     if (classification.kind === 'image') {
       const outPath = path.join(workDir, 'status_photo_hd.mp4');
@@ -1216,6 +1476,7 @@ async function drainQueue() {
 async function startBot() {
   await verifyFfmpegInstalled();
   await fs.mkdir(CONFIG.authDir, { recursive: true });
+  await loadContactsCache();
 
   const {
     makeWASocket,
@@ -1325,6 +1586,27 @@ async function startBot() {
 
       // 2) Handle `.status` command replying to (quoting) a video, photo, or image/video file
       const { text, contextInfo } = extractTextAndContext(msg.message);
+
+      // Quick diagnostic command to verify contacts & "My contacts except..." exclusion list
+      if (text.trim().toLowerCase() === '.statusinfo') {
+        if (!msg.key.fromMe && !isAllowedSender(msg.key)) continue;
+        const audience = await resolveStatusAudience(sock);
+        await safeSendMessage(
+          sock,
+          msg.key.remoteJid,
+          {
+            text: [
+              `Status Privacy: ${audience.privacyLabel}`,
+              `Synced contacts cached: ${knownStatusJids.size}`,
+              `Excluded contacts: ${audience.excludedCount}`,
+              `Viewers who will receive .status: ${audience.statusJidList.length}`,
+            ].join('\n'),
+          },
+          { quoted: msg }
+        );
+        continue;
+      }
+
       const statusCmdMatch = text.trim().match(/^\.status(?:\s+([\s\S]*))?$/i);
       if (statusCmdMatch) {
         // Allow bot owner anywhere (including groups/self-chat) or allowed DM senders
