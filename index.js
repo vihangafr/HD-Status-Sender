@@ -3,21 +3,20 @@
  * WAstatus-Style HD WhatsApp Status Bot (CommonJS, QR Scan, Zero-DB, VPS-Ready)
  * ============================================================================
  *
- * HOW IT WORKS (SELF-ONLY MODE):
+ * HOW IT WORKS (PUBLIC MODE):
  * 1. Start the bot on your VPS and scan the terminal QR code in WhatsApp
  *    (WhatsApp -> Linked Devices -> Link a Device).
- * 2. In your own "Message yourself" chat, send any video or photo as a
- *    FILE / DOCUMENT (📎 -> Document) so WhatsApp uploads the untouched original.
- * 3. This bot encodes it with FFmpeg (libx264 + AAC) using WAstatus's
- *    Status-safe HD profile (1080p/30fps <= 29s, or add "720p" for 720p <= 59s,
- *    strictly < 15.4 MB) and returns the ready-to-post clip(s) to your chat.
- * 4. Reply/quote any video, photo, or image/video file with `.status`
- *    (or `.status your caption`) to post directly to your WhatsApp Status in
- *    full original quality and native FPS (e.g. 60 fps), honoring your
- *    WhatsApp Status privacy ("My contacts except...").
- * 5. Reply/quote any regular (non-View Once) photo, video, audio, or file with
- *    `.save` to copy it privately to your "Message yourself" inbox.
- * 6. Utility commands: `.menu`, `.ping`, `.runtime`, `.statusinfo`.
+ * 2. Anyone in a DM can send a video or photo as a FILE / DOCUMENT
+ *    (📎 -> Document) to get WAstatus-profile Status clips (1080p/30fps <= 29s,
+ *    or add "720p" for 720p <= 59s, strictly < 15.4 MB).
+ * 3. Anyone (in DMs or groups) can reply/quote any image or video file with
+ *    `.hd` (or `.hd your caption`) — or put `.hd` in the file caption — to get
+ *    it sent back as a native WhatsApp video/photo in full original quality,
+ *    original bitrate, and original FPS with its caption (if available).
+ * 4. Owner-only commands: `.status` (post full-quality Status respecting your
+ *    WhatsApp Status privacy), `.statusinfo`, and `.save` (copy regular media
+ *    privately to your self-chat).
+ * 5. Public utility commands: `.menu`, `.ping`, `.runtime`.
  *
  * VPS SETUP (Ubuntu / Debian):
  *   sudo apt update && sudo apt install -y ffmpeg
@@ -26,6 +25,7 @@
  *   node bot.js
  *
  * OPTIONAL ENVIRONMENT VARIABLES:
+ *   ALLOWED_NUMBERS=                          # Leave empty for everyone, or comma-separated numbers to restrict
  *   STATUS_CONTACTS=14155551234,919876543210  # Extra contacts always included in .status viewers
  *   STATUS_EXCEPT=14155551234,919876543210    # Extra contacts always excluded ("My contacts except...")
  *   MIN_SEND_DELAY_MS=1200                    # Minimum pacing delay between outgoing messages
@@ -230,28 +230,35 @@ function formatRuntime(ms) {
 }
 
 function buildMenuText() {
+  const modeLabel =
+    CONFIG.allowedNumbers.size > 0
+      ? 'Restricted (ALLOWED_NUMBERS)'
+      : 'Public (Works for everyone)';
+
   return [
     '*HD Status Bot — User Manual*',
-    '_Mode: Self-Only (ignores all other users)_',
+    `_Mode: ${modeLabel}_`,
     '',
-    '*1. HD Status Video Converter*',
-    '• In your *Message yourself* chat, send any video or photo as a *Document / File* (📎 → Document).',
+    '*1. Full Original Quality Return (.hd)*',
+    '• `.hd` — Reply to any image or video file (or put `.hd` in its caption) to get it sent back in full original quality, original bitrate & original FPS.',
+    '• `.hd Your caption` — Override or add a caption; otherwise keeps the original caption (empty if none).',
+    '',
+    '*2. HD Status Video Converter (DM Files)*',
+    '• Send any video or photo to this DM as a *Document / File* (📎 → Document).',
     '• Default: 1080p HD, 30 fps, auto-split ≤ 29s (< 16 MB).',
     '• Add `720p` in file caption for 720p clips up to 59s.',
     '• Add e.g. `12s` on a photo file to set video length (3–29s).',
     '• Any other caption text is kept; empty caption stays empty.',
     '',
-    '*2. Direct Full-Quality Status Post*',
-    '• `.status` — Reply to any video, photo, or image/video file (or put `.status` in its caption) to post directly to your Status at full original quality & FPS (including 60 fps).',
-    '• `.status Your caption` — Post with a custom caption.',
-    '• Automatically respects your WhatsApp Status privacy ("My contacts except...").',
-    '',
-    '*3. Utilities*',
-    '• `.save` — Reply to any regular (non-View Once) photo, video, audio, or file to copy it privately to your inbox.',
-    '• `.statusinfo` — Check active Status privacy & viewer count.',
+    '*3. Public Utilities*',
     '• `.ping` — Check bot & WhatsApp server latency.',
     '• `.runtime` — Check bot uptime, RAM usage & queue.',
     '• `.menu` — Show this user manual.',
+    '',
+    '*4. Owner-Only Commands*',
+    '• `.status` — Reply to media/file (or caption it) to post directly to bot Status in full original quality & FPS.',
+    '• `.statusinfo` — Check active Status privacy & viewer count.',
+    '• `.save` — Reply to any regular (non-View Once) photo, video, audio, or file to copy it privately to your inbox.',
   ].join('\n');
 }
 
@@ -728,6 +735,7 @@ function extractMediaDescriptor(rawMessage, allowProbeFallback = false) {
  */
 function extractQuotedMedia(contextInfo) {
   const rawQuoted = contextInfo?.quotedMessage;
+  if (!rawQuoted || isViewOnceMessage(rawQuoted)) return null;
   return extractMediaDescriptor(rawQuoted, true);
 }
 
@@ -738,9 +746,13 @@ function extractQuotedSavableMedia(contextInfo) {
   const rawQuoted = contextInfo?.quotedMessage;
   if (!rawQuoted) return null;
 
+  if (isViewOnceMessage(rawQuoted)) {
+    return { blockedViewOnce: true };
+  }
+
   const unwrapped = unwrapMessage(rawQuoted);
   if (!unwrapped) return null;
-console.log(contextInfo)
+
   if (unwrapped.imageMessage) {
     const mime = (unwrapped.imageMessage.mimetype || 'image/jpeg').toLowerCase();
     const ext = mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : '.jpg';
@@ -916,27 +928,36 @@ async function probeMedia(filePath) {
 }
 
 /**
- * Checks whether a 1-on-1 DM sender is permitted to trigger the bot.
- * Supports standard JIDs (@s.whatsapp.net) and Baileys v7 LID alt JIDs.
+ * Checks whether a sender is permitted to trigger the bot.
+ * Supports everyone by default (DMs and groups) unless ALLOWED_NUMBERS is configured.
  */
 function isAllowedSender(msgKey) {
   const remoteJid = msgKey?.remoteJid;
   if (!remoteJid) return false;
 
-  // Ignore groups, channels, and status broadcasts
-  if (
-    remoteJid.endsWith('@g.us') ||
-    remoteJid.endsWith('@newsletter') ||
-    remoteJid === 'status@broadcast'
-  ) {
+  // Ignore channels and status broadcasts
+  if (remoteJid.endsWith('@newsletter') || remoteJid === 'status@broadcast') {
     return false;
   }
 
+  // Bot owner is always allowed
+  if (msgKey.fromMe) {
+    return true;
+  }
+
+  // Empty ALLOWED_NUMBERS means public mode (everyone can use the bot)
   if (CONFIG.allowedNumbers.size === 0) {
     return true;
   }
 
-  const candidateJids = [remoteJid, msgKey.remoteJidAlt, msgKey.senderPn].filter(Boolean);
+  const candidateJids = [
+    msgKey.participant,
+    msgKey.participantAlt,
+    remoteJid,
+    msgKey.remoteJidAlt,
+    msgKey.senderPn,
+  ].filter(Boolean);
+
   return candidateJids.some((jid) => {
     const digits = String(jid).split('@')[0].split(':')[0].replace(/\D/g, '');
     return digits && CONFIG.allowedNumbers.has(digits);
@@ -1340,14 +1361,18 @@ async function prepareFullQualityStatusMedia({ inputPath, workDir, kind, ext, mi
     '-preset',
     CONFIG.ffmpegPreset,
     '-crf',
-    '16',
+    '15',
     '-profile:v',
     'high',
     '-pix_fmt',
     'yuv420p'
   );
   if (meta.hasAudio) {
-    args.push('-c:a', 'aac', '-b:a', '192k');
+    if (meta.audioCodec === 'aac') {
+      args.push('-c:a', 'copy');
+    } else {
+      args.push('-c:a', 'aac', '-b:a', '256k');
+    }
   }
   args.push('-movflags', '+faststart', outPath);
 
@@ -1363,6 +1388,115 @@ async function prepareFullQualityStatusMedia({ inputPath, workDir, kind, ext, mi
 // ----------------------------------------------------------------------------
 // Core Media Job Processor
 // ----------------------------------------------------------------------------
+
+/**
+ * Handles `.hd`: downloads a quoted (or direct) image/video file and sends it back
+ * to the chat as native media at full original quality, bitrate, and FPS.
+ */
+async function processHdCommandJob(
+  sock,
+  downloadMediaMessage,
+  msg,
+  contextInfo,
+  targetMedia,
+  cmdCaption,
+  isDirectMedia = false
+) {
+  const sourceChatJid = msg.key.remoteJid;
+
+  if (targetMedia.fileLength > CONFIG.maxInputBytes) {
+    await safeSendMessage(
+      sock,
+      sourceChatJid,
+      {
+        text: `File is too large (${(targetMedia.fileLength / 1024 / 1024).toFixed(1)} MB). Max allowed is ${(
+          CONFIG.maxInputBytes /
+          1024 /
+          1024
+        ).toFixed(0)} MB.`,
+      },
+      { quoted: msg }
+    );
+    return;
+  }
+
+  const workDir = path.join(os.tmpdir(), `wa-hd-cmd-${crypto.randomUUID()}`);
+  await fs.mkdir(workDir, { recursive: true });
+  const inputPath = path.join(workDir, `hd_source${targetMedia.ext}`);
+
+  try {
+    const botSelfIds = new Set(
+      [normalizeAnyJid(sock.user?.id), normalizeAnyJid(sock.user?.lid)].filter(Boolean)
+    );
+    const quotedSender = normalizeAnyJid(contextInfo?.participant);
+    const normalizedChatJid = normalizeAnyJid(sourceChatJid);
+    const quotedFromMe = quotedSender
+      ? botSelfIds.has(quotedSender)
+      : botSelfIds.has(normalizedChatJid);
+
+    const downloadTargetMsg = isDirectMedia
+      ? {
+          key: msg.key,
+          message: targetMedia.message,
+        }
+      : {
+          key: {
+            remoteJid: sourceChatJid,
+            id: contextInfo.stanzaId,
+            fromMe: quotedFromMe,
+            participant: contextInfo.participant,
+          },
+          message: targetMedia.message,
+        };
+
+    logInfo(`[.hd] Downloading ${targetMedia.kind} media for ${sourceChatJid}...`);
+    await downloadMediaToFile(sock, downloadMediaMessage, downloadTargetMsg, inputPath);
+
+    logInfo(`[.hd] Preparing full original quality ${targetMedia.kind}...`);
+    const prepared = await prepareFullQualityStatusMedia({
+      inputPath,
+      workDir,
+      kind: targetMedia.kind,
+      ext: targetMedia.ext,
+      mimetype: targetMedia.mimetype,
+    });
+
+    // Attach caption only if provided via `.hd <caption>` or present on the quoted file
+    const inheritedCaption = isDirectMedia ? '' : targetMedia.caption || '';
+    const finalCaption = (cmdCaption || inheritedCaption).trim();
+
+    const mediaPayload =
+      prepared.kind === 'video'
+        ? { video: { url: prepared.finalPath }, mimetype: prepared.mimetype }
+        : { image: { url: prepared.finalPath }, mimetype: prepared.mimetype };
+
+    if (finalCaption) {
+      mediaPayload.caption = finalCaption;
+    }
+
+    await safeSendMessage(sock, sourceChatJid, mediaPayload, { quoted: msg });
+
+    const stat = await fs.stat(prepared.finalPath);
+    const sizeMb = (stat.size / 1024 / 1024).toFixed(2);
+    logInfo(
+      `[.hd] Sent ${prepared.kind} back to ${sourceChatJid} (${prepared.summary}, ${sizeMb} MB)`
+    );
+  } catch (err) {
+    logError(`Failed .hd command from ${sourceChatJid}`, err);
+    try {
+      await safeSendMessage(
+        sock,
+        sourceChatJid,
+        { text: `Failed to process .hd media: ${err.message}` },
+        { quoted: msg }
+      );
+    } catch {
+      // Ignore secondary send error if socket disconnected mid-job
+    }
+  } finally {
+    await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
 
 async function processStatusCommandJob(
   sock,
@@ -1829,7 +1963,7 @@ async function startBot() {
       reconnectAttempts = 0;
       addStatusJid(sock.user?.id);
       logInfo(
-        'Connected to WhatsApp (SELF-ONLY mode)! Send .menu in "Message yourself" to see all commands.'
+        'Connected to WhatsApp (PUBLIC mode)! Anyone can use .hd, .menu, .ping, .runtime, or send DM files.'
       );
     }
 
@@ -1866,44 +2000,66 @@ async function startBot() {
       addStatusJid(msg.key.remoteJid);
       addStatusJid(msg.key.remoteJidAlt);
 
-      // STRICT SELF-ONLY MODE: Never respond to or process messages from anyone else
-      if (!msg.key.fromMe) continue;
+      if (!isAllowedSender(msg.key)) continue;
 
+      const remoteJid = msg.key.remoteJid;
+      const isGroup = remoteJid.endsWith('@g.us');
+      const isOwner = Boolean(msg.key.fromMe);
       const inSelfChat = isSelfChat(sock, msg.key);
-      const replyTargetJid = inSelfChat
-        ? msg.key.remoteJid
-        : getSelfChatJid(sock) || msg.key.remoteJid;
-      const replyOpts = replyTargetJid === msg.key.remoteJid ? { quoted: msg } : {};
 
-      // 1) Handle `.status` put directly as the caption of a photo, video, or image/video file
+      // Public commands reply directly in the active chat; owner-only notifications go to self-chat if outside self-chat
+      const ownerReplyJid = inSelfChat ? remoteJid : getSelfChatJid(sock) || remoteJid;
+      const ownerReplyOpts = ownerReplyJid === remoteJid ? { quoted: msg } : {};
+
+      // 1) Handle `.hd` or owner-only `.status` placed directly in a photo/video/file caption
       const directMedia = extractMediaDescriptor(msg.message, true);
-      const directStatusMatch = directMedia?.caption
-        ? directMedia.caption.trim().match(/^\.status(?:\s+([\s\S]*))?$/i)
-        : null;
-      if (directStatusMatch) {
-        const cmdCaption = (directStatusMatch[1] || '').trim();
-        logInfo(`Queued direct .status (${directMedia.kind}) from ${msg.key.remoteJid}`);
-        enqueueJob(() =>
-          processStatusCommandJob(
-            sock,
-            downloadMediaMessage,
-            msg,
-            null,
-            directMedia,
-            cmdCaption,
-            true
-          )
-        );
-        continue;
+      if (directMedia?.caption) {
+        const directTrimmed = directMedia.caption.trim();
+
+        const directHdMatch = directTrimmed.match(/^\.hd(?:\s+([\s\S]*))?$/i);
+        if (directHdMatch) {
+          const cmdCaption = (directHdMatch[1] || '').trim();
+          logInfo(`Queued direct .hd (${directMedia.kind}) from ${remoteJid}`);
+          enqueueJob(() =>
+            processHdCommandJob(
+              sock,
+              downloadMediaMessage,
+              msg,
+              null,
+              directMedia,
+              cmdCaption,
+              true
+            )
+          );
+          continue;
+        }
+
+        const directStatusMatch = directTrimmed.match(/^\.status(?:\s+([\s\S]*))?$/i);
+        if (directStatusMatch && isOwner) {
+          const cmdCaption = (directStatusMatch[1] || '').trim();
+          logInfo(`Queued direct .status (${directMedia.kind}) from ${remoteJid}`);
+          enqueueJob(() =>
+            processStatusCommandJob(
+              sock,
+              downloadMediaMessage,
+              msg,
+              null,
+              directMedia,
+              cmdCaption,
+              true
+            )
+          );
+          continue;
+        }
       }
 
-      // 2) Handle text commands (`.menu`, `.ping`, `.runtime`, `.statusinfo`, `.status`)
+      // 2) Handle text commands (Public: .hd, .menu, .ping, .runtime | Owner-only: .status, .statusinfo, .save)
       const { text, contextInfo } = extractTextAndContext(msg.message);
       const trimmedText = text.trim();
       const cmdLower = trimmedText.toLowerCase();
 
       if (cmdLower === '.menu' || cmdLower === '.help') {
-        await safeSendMessage(sock, replyTargetJid, { text: buildMenuText() }, replyOpts);
+        await safeSendMessage(sock, remoteJid, { text: buildMenuText() }, { quoted: msg });
         continue;
       }
 
@@ -1911,9 +2067,9 @@ async function startBot() {
         const pingResult = await measureWhatsAppPing(sock);
         await safeSendMessage(
           sock,
-          replyTargetJid,
+          remoteJid,
           { text: `Pong!\n${pingResult.type}: ${pingResult.ms} ms` },
-          replyOpts
+          { quoted: msg }
         );
         continue;
       }
@@ -1921,28 +2077,61 @@ async function startBot() {
       if (cmdLower === '.runtime') {
         const uptimeStr = formatRuntime(Date.now() - botStartedAt);
         const memMb = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
+        const modeLabel =
+          CONFIG.allowedNumbers.size > 0 ? 'Restricted (ALLOWED_NUMBERS)' : 'Public';
         await safeSendMessage(
           sock,
-          replyTargetJid,
+          remoteJid,
           {
             text: [
               '*Bot Runtime*',
               `Uptime: ${uptimeStr}`,
               `RAM Usage: ${memMb} MB`,
               `Queued Jobs: ${jobQueue.length}`,
-              'Mode: Self-Only',
+              `Mode: ${modeLabel}`,
             ].join('\n'),
           },
-          replyOpts
+          { quoted: msg }
         );
         continue;
       }
 
-      if (cmdLower === '.statusinfo') {
+      const hdCmdMatch = trimmedText.match(/^\.hd(?:\s+([\s\S]*))?$/i);
+      if (hdCmdMatch) {
+        const quotedMedia = extractQuotedMedia(contextInfo);
+        if (!quotedMedia) {
+          await safeSendMessage(
+            sock,
+            remoteJid,
+            {
+              text: 'Reply to (quote) an image or video file with `.hd` to receive it back in full original quality, bitrate, and FPS.',
+            },
+            { quoted: msg }
+          );
+          continue;
+        }
+
+        const cmdCaption = (hdCmdMatch[1] || '').trim();
+        logInfo(`Queued quoted .hd (${quotedMedia.kind}) from ${remoteJid}`);
+        enqueueJob(() =>
+          processHdCommandJob(
+            sock,
+            downloadMediaMessage,
+            msg,
+            contextInfo,
+            quotedMedia,
+            cmdCaption,
+            false
+          )
+        );
+        continue;
+      }
+
+      if (cmdLower === '.statusinfo' && isOwner) {
         const audience = await resolveStatusAudience(sock);
         await safeSendMessage(
           sock,
-          replyTargetJid,
+          ownerReplyJid,
           {
             text: [
               `Status Privacy: ${audience.privacyLabel}`,
@@ -1951,22 +2140,22 @@ async function startBot() {
               `Viewers who will receive .status: ${audience.statusJidList.length}`,
             ].join('\n'),
           },
-          replyOpts
+          ownerReplyOpts
         );
         continue;
       }
 
       const saveCmdMatch = trimmedText.match(/^\.save(?:\s+([\s\S]*))?$/i);
-      if (saveCmdMatch) {
+      if (saveCmdMatch && isOwner) {
         const quotedSavable = extractQuotedSavableMedia(contextInfo);
         if (quotedSavable?.blockedViewOnce) {
           await safeSendMessage(
             sock,
-            replyTargetJid,
+            ownerReplyJid,
             {
               text: 'View Once media is skipped and cannot be saved. `.save` works on regular photos, videos, audio, and files.',
             },
-            replyOpts
+            ownerReplyOpts
           );
           continue;
         }
@@ -1974,17 +2163,17 @@ async function startBot() {
         if (!quotedSavable) {
           await safeSendMessage(
             sock,
-            replyTargetJid,
+            ownerReplyJid,
             {
               text: 'Reply to (quote) a regular photo, video, audio, or file with `.save` to copy it privately to your inbox.',
             },
-            replyOpts
+            ownerReplyOpts
           );
           continue;
         }
 
         const cmdCaption = (saveCmdMatch[1] || '').trim();
-        logInfo(`Queued .save (${quotedSavable.kind}) from ${msg.key.remoteJid}`);
+        logInfo(`Queued .save (${quotedSavable.kind}) from ${remoteJid}`);
         enqueueJob(() =>
           processSaveMediaJob(
             sock,
@@ -1999,22 +2188,22 @@ async function startBot() {
       }
 
       const statusCmdMatch = trimmedText.match(/^\.status(?:\s+([\s\S]*))?$/i);
-      if (statusCmdMatch) {
+      if (statusCmdMatch && isOwner) {
         const quotedMedia = extractQuotedMedia(contextInfo);
         if (!quotedMedia) {
           await safeSendMessage(
             sock,
-            replyTargetJid,
+            ownerReplyJid,
             {
               text: 'Reply to (quote) a video, photo, or image/video file with `.status` to post it to Status in full original quality.',
             },
-            replyOpts
+            ownerReplyOpts
           );
           continue;
         }
 
         const cmdCaption = (statusCmdMatch[1] || '').trim();
-        logInfo(`Queued quoted .status (${quotedMedia.kind}) from ${msg.key.remoteJid}`);
+        logInfo(`Queued quoted .status (${quotedMedia.kind}) from ${remoteJid}`);
         enqueueJob(() =>
           processStatusCommandJob(
             sock,
@@ -2029,8 +2218,8 @@ async function startBot() {
         continue;
       }
 
-      // 3) Auto-convert incoming Document/File uploads ONLY inside your "Message yourself" chat
-      if (!inSelfChat) continue;
+      // 3) Auto-convert incoming Document/File uploads for everyone in 1-on-1 DMs
+      if (isGroup) continue;
 
       const docMsg = extractDocumentFromMessage(msg.message);
       if (!docMsg) continue;
@@ -2039,7 +2228,7 @@ async function startBot() {
       if (!classification) continue;
 
       logInfo(
-        `Queued ${classification.kind} document "${docMsg.fileName || 'unnamed'}" from ${msg.key.remoteJid}`
+        `Queued ${classification.kind} document "${docMsg.fileName || 'unnamed'}" from ${remoteJid}`
       );
 
       enqueueJob(() =>
